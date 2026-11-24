@@ -274,7 +274,7 @@ fun McxApp(state: UiState, actions: UiActions, initialTab: Int = 0) {
             state.incoming?.let { IncomingCall(it, actions) }
             if (!state.provisioned) Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = actions::scanProvisioning, modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(containerColor = LightGrey, contentColor = Mcx.Ink)) { Text("Scan QR code") }
+                    colors = ButtonDefaults.buttonColors(containerColor = LightGrey, contentColor = LightMcx.Ink)) { Text("Scan QR code") }
                 Button(onClick = actions::importProvisioning, modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.buttonColors(containerColor = Mcx.Ink)) { Text("Import MCX profile") }
             }
@@ -370,7 +370,7 @@ private fun SettingsScreen(state: UiState, actions: UiActions, close: () -> Unit
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                 // The outlined action on the left, the filled one on the right, as every pair of buttons here.
                 Button(onClick = actions::scanProvisioning, modifier = Modifier.testTag(Tags.SCAN_QR),
-                    colors = ButtonDefaults.buttonColors(containerColor = LightGrey, contentColor = Mcx.Ink)) { Text("Scan QR code") }
+                    colors = ButtonDefaults.buttonColors(containerColor = LightGrey, contentColor = LightMcx.Ink)) { Text("Scan QR code") }
                 Button(onClick = actions::importProvisioning, modifier = Modifier.testTag(Tags.IMPORT)) { Text("Import MCX profile") }
             }
             Text("Import the profile file, or scan the QR code your administrator shows: it carries the profile or a one-time link to it.",
