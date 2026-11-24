@@ -1,1 +1,45 @@
-pbcopy < ~/Downloads/virtuser-mcx/.github/workflows/build-android.yml
+# Builds the Virtuser MCX Android app and publishes it as a GitHub Release.
+# Latest APK, always at the same address:
+#   https://github.com/cborrman/virtuser-mcx/releases/latest/download/virtuser-mcx.apk
+name: Build Virtuser MCX (Android)
+
+on:
+  push:
+    branches: [main]
+    paths: ['android/**', '.github/workflows/build-android.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build the APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../virtuser-mcx.apk
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: Virtuser MCX 0.1.${{ github.run_number }}
+          body: |
+            Virtuser MCX for Android 13 and later (based on OpenMCX, AGPL-3.0).
+            Test build, signed with the test key: for demo phones only.
+            Install: open this link on the phone and install the APK
+            https://github.com/cborrman/virtuser-mcx/releases/latest/download/virtuser-mcx.apk
+          files: virtuser-mcx.apk
+          make_latest: true
