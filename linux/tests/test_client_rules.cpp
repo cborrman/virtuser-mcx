@@ -1,0 +1,664 @@
+//
+// OpenMCX Licence Information : AGPL-3.0-or-later
+//
+
+// Unit tests of src/client/core/client_rules.hpp: the rules of the MC client that need no client state.
+//
+// Specifications: TS 24.282 V19.7.0 (Rel-19), TS 24.379 V19.7.0 (Rel-19), TS 24.380 V19.2.0 (Rel-19),
+// TS 33.180 V19.4.0 (Rel-19), TS 24.484 V19.6.0 (Rel-19), RFC 3261, RFC 3903, RFC 3986, RFC 6749.
+
+#include "client_rules.hpp"
+
+#include <cstdio>
+#include <deque>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+int failures = 0;
+
+//------------------------------------------------------------------------------
+// Helper: count and report a failed check.
+void check(bool ok, const char *what) {
+  if (ok) return;
+  ++failures;
+  std::fprintf(stderr, "FAILED: %s\n", what);
+}
+
+//------------------------------------------------------------------------------
+// The part of an SDS or FD NOTIFICATION message the notifier rule reads.
+struct Notice {
+  std::optional<std::string> sender;
+};
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 15.1.5, 15.1.6 and 12.2.3 step 15c: the notifier of disposition notifications.
+void test_notifiers() {
+  using mcx::client_rules::notifiers;
+  const std::vector<Notice> single{{std::nullopt}};
+  check(notifiers(single, "alice", "") == std::vector<std::string>{"alice"}, "a single notice names the calling user");
+  check(!notifiers(single, "", ""), "a single notice without calling user or Sender IE is refused");
+  check(notifiers(std::vector<Notice>{{"bob"}}, "", "") == std::vector<std::string>{"bob"},
+        "a single notice without calling user names its Sender IE");
+  const std::vector<Notice> aggregated{{"bob"}, {"carol"}};
+  check(notifiers(aggregated, "alice", "group") == std::vector<std::string>{"bob", "carol"},
+        "an aggregated notification names each Sender IE, not the calling user");
+  check(!notifiers(aggregated, "alice", ""), "an aggregated notification not from a group is refused");
+  // The crash of the finding: aggregated, calling user present, one Sender IE missing.
+  check(!notifiers(std::vector<Notice>{{"bob"}, {std::nullopt}}, "alice", "group"),
+        "an aggregated notification with a notice without Sender IE is refused");
+  check(!notifiers(std::vector<Notice>{{"bob"}, {""}}, "", "group"), "an empty Sender IE is refused");
+}
+
+//------------------------------------------------------------------------------
+// RFC 3261 section 20.43 with TS 24.379 clause 4.4.1: the MC warning codes of a Warning header field.
+void test_has_warning() {
+  using mcx::client_rules::has_warning;
+  check(has_warning("399 mcdata \"149 SIP INFO request pending\"", 149), "149 in a 399 warn-text");
+  check(has_warning("149 mcx \"SIP INFO request pending\"", 149), "149 as the warn-code");
+  check(!has_warning("399 mcx \"110 user declined the call invitation\"", 149), "110 is not 149");
+  check(!has_warning("399 mcx \"163 user 149 is busy\"", 149), "149 inside the text is not the code");
+  check(!has_warning("399 host149 \"1490 other\"", 149), "1490 is not 149");
+  check(has_warning("399 a \"110 declined\", 399 b \"175 call is forwarded\"", 175), "the second warning-value");
+  check(has_warning("399 a \"x \\\"149 y\\\"\", 399 b \"149 z\"", 149), "escaped quotes skipped");
+  check(!has_warning("", 149), "an empty header");
+  check(!has_warning("399 mcx \"unterminated", 149), "an unterminated warn-text");
+}
+
+//------------------------------------------------------------------------------
+// TS 33.180 annex B.5 with RFC 6749 section 5.2: when a refused refresh token is dropped.
+void test_refresh_refusal() {
+  using mcx::client_rules::refresh_refusal_final;
+  check(!refresh_refusal_final(1, false, 100, 900), "a first refusal while the token is valid is retried");
+  check(refresh_refusal_final(2, false, 130, 900), "a second refusal in a row is final");
+  check(refresh_refusal_final(1, false, 900, 900), "a refusal once the token expired is final");
+  check(refresh_refusal_final(1, true, 100, 900), "a client with a password signs in again at once");
+}
+
+//------------------------------------------------------------------------------
+// TS 33.180 annex B.5.1: when the access token is renewed; the defaults stay 600 s ahead, halfway below 1200 s, and a
+// failed renewal again after 30 s.
+void test_token_renewal() {
+  using namespace mcx::client_rules;
+  check(default_token_renewal_lead_s == 600 && default_token_renewal_halfway_below_s == 1200 &&
+            default_token_renewal_retry_ms == 30000,
+        "the default renewal timing is unchanged");
+  check(token_renewal_delay_s(3600) == 3000, "a 1-hour token is renewed 10 minutes ahead");
+  check(token_renewal_delay_s(1200) == 600, "a 20-minute token is renewed 10 minutes ahead");
+  check(token_renewal_delay_s(900) == 450, "a 15-minute token is renewed halfway");
+  check(token_renewal_delay_s(3600, 300, 600) == 3300, "a configured lead");
+  check(token_renewal_delay_s(500, 300, 600) == 250, "a configured halfway bound");
+  check(token_renewal_delay_s(100, 300, 50) == 0, "a lead longer than the token renews at once");
+}
+
+//------------------------------------------------------------------------------
+// TS 33.180 table B.4.2.2-1: the scopes follow the configured services, key management only with keys.
+void test_oidc_scope() {
+  using mcx::client_rules::oidc_scope;
+  check(oidc_scope(false, false, false) ==
+            "openid 3gpp:mc:ptt_service 3gpp:mc:ptt_config_management_service 3gpp:mc:ptt_group_management_service",
+        "MCPTT alone");
+  const auto all = oidc_scope(true, true, true);
+  for (const char *scope : {"3gpp:mc:data_service", "3gpp:mc:video_service", "3gpp:mc:ptt_key_management_service",
+                            "3gpp:mc:data_key_management_service", "3gpp:mc:video_key_management_service",
+                            "3gpp:mc:video_group_management_service"})
+    check(all.find(scope) != std::string::npos, scope);
+  check(oidc_scope(true, false, false).find("video") == std::string::npos, "no MCVideo scope without MCVideo");
+  check(oidc_scope(false, false, false).find("location") == std::string::npos, "no location scope without an LMS");
+  check(oidc_scope(false, false, false, true).ends_with(" 3gpp:mc:location_management_service"),
+        "the location scope with an LMS");
+}
+
+//------------------------------------------------------------------------------
+// RFC 3986 section 2.1: percent-decoding without throwing on a bad escape.
+void test_percent_decode() {
+  using mcx::client_rules::percent_decode;
+  check(percent_decode("sip%3Agroup%40example.com") == "sip:group@example.com", "escapes decoded");
+  check(percent_decode("a%zzb") == "a%zzb", "a bad escape kept");
+  check(percent_decode("ab%4") == "ab%4", "a truncated escape kept");
+  check(percent_decode("%41") == "A", "an escape at the end");
+  check(percent_decode("%") == "%", "a lone percent");
+}
+
+//------------------------------------------------------------------------------
+// The escaped text of a control command (the "escaped" option of sds and sds-reply).
+void test_control_unescape() {
+  using mcx::client_rules::control_unescape;
+  check(control_unescape("one\\ntwo") == "one\ntwo", "a line break");
+  check(control_unescape("a\\\\nb") == "a\\nb", "an escaped backslash before n stays a backslash");
+  check(control_unescape("col\\tval") == "col\tval", "a tab");
+  check(control_unescape("C:\\dir") == "C:\\dir", "another backslash is kept");
+  check(control_unescape("end\\") == "end\\", "a trailing backslash is kept");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.484 clause 8.3.2: the groups of an MCPTT user profile (<MCPTTGroupInfo> uri-entries).
+void test_profile_groups() {
+  using mcx::client_rules::parse_profile_groups;
+  using Groups = std::vector<std::string>;
+  const std::string profile = "<mcptt-user-profile><ruleset><cp:rule><uri-entry>sip:not-a-group@x</uri-entry>"
+                              "</cp:rule></ruleset><OnNetwork><MCPTTGroupInfo><entry><uri-entry>sip:g1@x</uri-entry>"
+                              "<display-name>One</display-name></entry><entry><uri-entry>sip:g2@x</uri-entry></entry>"
+                              "</MCPTTGroupInfo><ImplicitAffiliations><entry><uri-entry>sip:g3@x</uri-entry></entry>"
+                              "</ImplicitAffiliations></OnNetwork></mcptt-user-profile>";
+  check(parse_profile_groups(profile) == Groups{"sip:g1@x", "sip:g2@x"}, "only the MCPTTGroupInfo entries");
+  check(parse_profile_groups("<p:MCPTTGroupInfo><p:entry><p:uri-entry>sip:g@x</p:uri-entry></p:entry>"
+                             "</p:MCPTTGroupInfo>") == Groups{"sip:g@x"},
+        "a namespace prefix");
+  check(parse_profile_groups("<MCPTTGroupInfo><entry><uri-entry>sip:a&amp;b@x</uri-entry></entry><entry>"
+                             "<uri-entry>sip:a&amp;b@x</uri-entry></entry><entry><uri-entry/></entry>"
+                             "<entry><uri-entry></uri-entry></entry></MCPTTGroupInfo>") == Groups{"sip:a&b@x"},
+        "entities, duplicates and empty entries");
+  check(parse_profile_groups("<MCPTTGroupInfo><entry><uri-entry>sip:g@x</uri-entry>").empty(),
+        "an unterminated element");
+  check(parse_profile_groups("<other>MCPTTGroupInfo</other>").empty(), "the name in text is not an element");
+  check(parse_profile_groups("<MCPTTGroupInfo><entry><uri-entry>sip:1@x</uri-entry></entry></MCPTTGroupInfo>"
+                             "<MCPTTGroupInfo><entry><uri-entry>sip:2@x</uri-entry></entry></MCPTTGroupInfo>") ==
+            Groups{"sip:1@x", "sip:2@x"},
+        "several MCPTTGroupInfo elements");
+  std::string many = "<MCPTTGroupInfo>";
+  for (int index = 0; index < 300; ++index)
+    many += "<entry><uri-entry>sip:g" + std::to_string(index) + "@x</uri-entry></entry>";
+  check(parse_profile_groups(many + "</MCPTTGroupInfo>").size() == 256, "at most 256 groups");
+  // TS 24.379 clause 10.1.4.2.1 step 1: the users of <RemoteGroupSelectionURIList>, apart from the groups.
+  const std::string remote = "<MCPTTGroupInfo><entry><uri-entry>sip:g@x</uri-entry></entry></MCPTTGroupInfo>"
+                             "<RemoteGroupSelectionURIList><entry><uri-entry>sip:u1@x</uri-entry></entry>"
+                             "</RemoteGroupSelectionURIList>";
+  check(mcx::client_rules::parse_profile_uri_entries(remote, "RemoteGroupSelectionURIList") == Groups{"sip:u1@x"},
+        "the remote group selection list");
+  check(parse_profile_groups(remote) == Groups{"sip:g@x"}, "the groups without the remote selection list");
+  // TS 24.379 clauses 6.2.8.1.8 and 6.2.8.3.1.1: the entries of the priority call rights.
+  using mcx::client_rules::profile_entry;
+  using mcx::client_rules::profile_entry_allows;
+  const std::string rights =
+      "<p:OnNetwork><p:MCPTT-group-call><p:EmergencyCall><p:MCPTTGroupInitiation><p:entry entry-info=\"DedicatedGroup\">"
+      "<p:uri-entry>sip:g1@x</p:uri-entry></p:entry></p:MCPTTGroupInitiation></p:EmergencyCall>"
+      "<p:EmergencyAlert><p:entry entry-info=\"UseCurrentlySelectedGroup\"/></p:EmergencyAlert></p:MCPTT-group-call>"
+      "<p:PrivateCall><p:EmergencyCall><p:MCPTTPrivateRecipient><p:entry entry-info=\"LocallyDetermined\"/>"
+      "</p:MCPTTPrivateRecipient></p:EmergencyCall></p:PrivateCall></p:OnNetwork>";
+  const auto group_call = profile_entry(rights, {"MCPTT-group-call", "EmergencyCall", "MCPTTGroupInitiation"});
+  check(group_call.present && group_call.entry_info == "DedicatedGroup" && group_call.uris == Groups{"sip:g1@x"},
+        "the emergency group call entry");
+  check(profile_entry_allows(group_call, "DedicatedGroup", "UseCurrentlySelectedGroup", "sip:g1@x") &&
+            !profile_entry_allows(group_call, "DedicatedGroup", "UseCurrentlySelectedGroup", "sip:g2@x"),
+        "a dedicated group allows that group only");
+  check(profile_entry_allows(profile_entry(rights, {"MCPTT-group-call", "EmergencyAlert"}), "DedicatedGroup",
+                             "UseCurrentlySelectedGroup", "sip:any@x"),
+        "the currently selected group");
+  check(profile_entry_allows(profile_entry(rights, {"PrivateCall", "EmergencyCall", "MCPTTPrivateRecipient"}),
+                             "UsePreConfigured", "LocallyDetermined", "sip:u@x"),
+        "a locally determined recipient");
+  check(!profile_entry(rights, {"ImminentPerilCall", "MCPTTGroupInitiation"}).present, "an absent entry");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.380 table 8.2.2.1-1: floor message names; the received-audio bound drops whole seconds past the limit.
+void test_floor_and_audio() {
+  using mcx::client_rules::audio_overflow;
+  using mcx::client_rules::floor_message_name;
+  check(floor_message_name(6) == "Floor Revoke", "Floor Revoke named");
+  check(floor_message_name(5) == "Floor Idle", "Floor Idle named");
+  check(floor_message_name(15) == "Floor Release Multi Talker" && floor_message_name(14) == "Queued Floor Requests" &&
+            floor_message_name(11) == "Unicast Media Flow Control" && floor_message_name(7) == "Floor Revoke Request",
+        "TS 24.380 8.2.14-8.2.17 named");
+  {
+    // TS 24.380 6.2.4.5.8: two talkers' frames are mixed (summed, saturated) once both have one; a paused talker
+    // holds the other back 5 frames at most; flush mixes what is waiting.
+    using Queue = std::deque<std::vector<std::int16_t>>;
+    Queue a, b;
+    std::vector<Queue *> queues{&a, &b};
+    a.push_back(std::vector<std::int16_t>(320, 1000));
+    check(!mcx::client_rules::mix_step(queues, false), "mixer waits for the other talker");
+    b.push_back(std::vector<std::int16_t>(320, 32000));
+    const auto mixed = mcx::client_rules::mix_step(queues, false);
+    check(mixed && (*mixed)[0] == 32767 && a.empty() && b.empty(), "two frames mixed, saturated");
+    for (int i = 0; i < 4; ++i) a.push_back(std::vector<std::int16_t>(320, 7));
+    check(!mcx::client_rules::mix_step(queues, false), "4 frames wait");
+    a.push_back(std::vector<std::int16_t>(320, 7));
+    const auto alone = mcx::client_rules::mix_step(queues, false);
+    check(alone && (*alone)[319] == 7 && a.size() == 4, "a paused talker holds back 5 frames at most");
+    int flushed = 0;
+    while (mcx::client_rules::mix_step(queues, true)) ++flushed;
+    check(flushed == 4 && a.empty(), "flush mixes what waits");
+  }
+  {
+    // TS 24.380 6.2.4.5.7 and 6.2.4.1: a Floor Idle in 'U: has permission' never releases the floor.
+    using mcx::client_rules::has_permission_floor_idle;
+    using mcx::client_rules::HasPermissionIdle;
+    constexpr std::uint16_t normal = 0x8000, dual = 0x8200;
+    check(has_permission_floor_idle(false, false, normal) == HasPermissionIdle::Discard,
+          "6.2.4.1: no override indication, the Floor Idle is discarded");
+    check(has_permission_floor_idle(false, false, dual) == HasPermissionIdle::Discard,
+          "6.2.4.1: the G-bit without an override indication is discarded");
+    check(has_permission_floor_idle(false, true, normal) == HasPermissionIdle::Discard,
+          "6.2.4.5.7 2: overridden, without the G-bit: discarded");
+    check(has_permission_floor_idle(false, true, dual) == HasPermissionIdle::EndOverridden,
+          "6.2.4.5.7 2: overridden, with the G-bit: the overridden indication removed");
+    check(has_permission_floor_idle(true, false, normal) == HasPermissionIdle::EndOverriding &&
+              has_permission_floor_idle(true, false, 0) == HasPermissionIdle::EndOverriding &&
+              has_permission_floor_idle(true, false, dual) == HasPermissionIdle::EndOverriding,
+          "6.2.4.5.7 1: overriding, with or without the G-bit: the overriding indication removed");
+  }
+  {
+    // TS 24.380 6.2.4.5.4 4a.i / 5a.i and 6.2.4.5.3 1c: the G-bit of the Floor Release.
+    using mcx::client_rules::release_dual_floor;
+    check(release_dual_floor(std::uint16_t{0x8200}, false), "6.2.4.5.4 4a.i: a Floor Revoke with the G-bit");
+    check(!release_dual_floor(std::uint16_t{0x8000}, true), "6.2.4.5.4 5a.i: a Floor Revoke without the G-bit");
+    check(!release_dual_floor(std::uint16_t{0}, true), "6.2.4.5.4 5a.i: a Floor Revoke without a Floor Indicator");
+    check(release_dual_floor(std::nullopt, true), "6.2.4.5.3 1c: granted with the G-bit");
+    check(!release_dual_floor(std::nullopt, false), "6.2.4.5.3 1c: granted without the G-bit");
+  }
+  {
+    using mcx::client_rules::floor_queueing_bit;
+    check(floor_queueing_bit(true, true) == 0x0400, "8.2.3.15 F: queueing negotiated");
+    check(floor_queueing_bit(true, false) == 0, "8.2.3.15 F: offered, not in the answer");
+    check(floor_queueing_bit(false, true) == 0, "8.2.3.15 F: not offered");
+    check((0x8000 | floor_queueing_bit(true, true)) == 0x8400, "normal call with queueing: A and F (1000010000000000)");
+  }
+  check(floor_message_name(12) == "unknown", "an unassigned type");
+  check(audio_overflow(100, 100, 16) == 0, "at the limit nothing is dropped");
+  check(audio_overflow(116, 100, 16) == 0, "within a second past the limit nothing is dropped");
+  check(audio_overflow(117, 100, 16) == 17, "past a second the excess is dropped");
+}
+
+//------------------------------------------------------------------------------
+// RFC 3550 appendix A.1: a packet received both by unicast and by multicast is kept once.
+void test_rtp_sequence() {
+  using mcx::client_rules::rtp_sequence_newer;
+  check(rtp_sequence_newer(11, 10), "the next packet is newer");
+  check(!rtp_sequence_newer(10, 10), "a copy received again is not newer");
+  check(!rtp_sequence_newer(9, 10), "an older packet is not newer");
+  check(rtp_sequence_newer(0, 65535), "the sequence number wraps");
+  check(!rtp_sequence_newer(65535, 0), "an older packet across the wrap is not newer");
+  check(!rtp_sequence_newer(10 + 0x8000, 10), "half the sequence space ahead is not newer");
+
+  // A change from the subchannel to unicast: unicast 69 and 70 come before the radio's late 68.
+  mcx::client_rules::RtpReceiveWindow window;
+  check(window.fresh(7, 60), "the first packet is fresh");
+  for (std::uint16_t sequence = 60; sequence <= 67; sequence++) window.keep(7, sequence);
+  check(window.ahead(7, 68) == 1 && window.ahead(7, 69) == 2, "a gap ahead is measured");
+  window.keep(7, 69);
+  window.keep(7, 70);
+  check(window.fresh(7, 68), "a late packet within the window is fresh");
+  window.keep(7, 68);
+  check(!window.fresh(7, 68) && !window.fresh(7, 69), "a packet kept is a copy");
+  check(window.ahead(7, 68) == 0, "an older packet is not ahead");
+  check(!window.fresh(7, static_cast<std::uint16_t>(70 - 64)), "a packet the window behind is too old");
+  check(window.fresh(8, 1), "another SSRC starts again");
+  window.keep(9, 65535);
+  window.keep(9, 1);
+  check(window.fresh(9, 0) && !window.fresh(9, 65535), "the window wraps with the sequence number");
+  window.keep(9, 2000);
+  check(!window.fresh(9, 1) && window.fresh(9, 1999), "a jump past the window forgets the older packets");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.581 clauses 14.2.3, 14.2.6, 14.3.3, 14.4, 12.1.2.2, 6.2.4.3.2 and 6.2.5.3.3: the offered, negotiated and
+// requested MCVideo transmission and reception priorities.
+void test_mc_priorities() {
+  using mcx::client_rules::negotiated_mc_priority;
+  using mcx::client_rules::offered_mc_priority;
+  using mcx::client_rules::request_priority;
+  using P = std::optional<std::uint8_t>;
+  check(!offered_mc_priority(0), "default priority not offered");
+  check(offered_mc_priority(5) == P(5) && offered_mc_priority(255) == P(99), "configured priority offered");
+  check(negotiated_mc_priority(false, P(5), P(3)) == P(3), "offerer: the lower answer");
+  check(negotiated_mc_priority(false, P(5), P(9)) == P(5), "offerer: an answer above the offer is capped");
+  check(!negotiated_mc_priority(false, std::nullopt, P(3)), "offerer: a parameter not offered is discarded");
+  check(!negotiated_mc_priority(false, P(5), std::nullopt), "offerer: no answer parameter, default priority");
+  check(negotiated_mc_priority(true, std::nullopt, P(4)) == P(4) && negotiated_mc_priority(true, P(5), P(4)) == P(4),
+        "answerer: the offered value");
+  check(request_priority(5, P(3)) == P(3) && request_priority(2, P(3)) == P(2), "request capped by the negotiated");
+  check(!request_priority(0, P(3)) && !request_priority(5, std::nullopt) && !request_priority(5, P(0)),
+        "default request priority: no field");
+}
+
+} // namespace
+
+//------------------------------------------------------------------------------
+// TS 24.379 clause 7.2.2 with RFC 3261 section 20.33: when a refused initial service authorisation is published again.
+void test_authorization_retry() {
+  using mcx::client_rules::authorization_retry_delay_ms;
+  check(authorization_retry_delay_ms(403, 0) == 5000u, "a 403 is retried after 5 s");
+  check(authorization_retry_delay_ms(403, 1) == 10000u, "the second retry after 10 s");
+  check(authorization_retry_delay_ms(403, 2) == 20000u, "the third retry after 20 s");
+  check(authorization_retry_delay_ms(403, 3) == 60000u, "then every 60 s");
+  check(authorization_retry_delay_ms(408, 50) == 60000u, "a timed-out transaction is retried, at most every 60 s");
+  check(authorization_retry_delay_ms(480, 0) == 5000u, "a 480 is retried");
+  check(authorization_retry_delay_ms(486, 3) == 60000u, "a 486 (another client authorised) is retried");
+  check(authorization_retry_delay_ms(503, 0, "30") == 30000u, "a 503 honours Retry-After");
+  check(authorization_retry_delay_ms(500, 4, " 2 (busy)") == 2000u, "a 500 honours Retry-After with a comment");
+  check(authorization_retry_delay_ms(503, 0, "0") == 1000u, "a Retry-After of 0 waits 1 s");
+  check(authorization_retry_delay_ms(503, 0, "99999") == 600000u, "a long Retry-After is bounded to 10 minutes");
+  check(authorization_retry_delay_ms(503, 1, "soon") == 10000u, "a Retry-After that is not a number is ignored");
+  check(authorization_retry_delay_ms(403, 0, "30") == 5000u, "a Retry-After in a 403 is ignored");
+  check(!authorization_retry_delay_ms(400, 0), "a 400 is final");
+  check(!authorization_retry_delay_ms(401, 0), "a 401 is left to the SIP stack's challenge handling");
+  check(!authorization_retry_delay_ms(404, 0), "a 404 is final");
+  check(!authorization_retry_delay_ms(412, 0), "a 412 is handled as RFC 3903 section 5 says");
+  check(!authorization_retry_delay_ms(488, 0), "a 488 is final");
+  check(!authorization_retry_delay_ms(603, 0), "a 603 is final");
+  check(authorization_retry_delay_ms(477, 0) == 5000u, "a 477 (the SIP core could not send to the server) is retried");
+  check(authorization_retry_delay_ms(478, 2) == 20000u, "a 478 (the server's address did not resolve) is retried");
+  using mcx::client_rules::transient_authorization_refusal;
+  check(transient_authorization_refusal(477) && transient_authorization_refusal(503),
+        "a refresh refused with 477 or 503 is published anew");
+  check(!transient_authorization_refusal(412) && !transient_authorization_refusal(404),
+        "a 412 and a 404 are not transient refusals");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.379 clause 9A.2.1.3: the outcome of an alias of the last status change from its status in a NOTIFY.
+void test_alias_outcome() {
+  using mcx::client_rules::alias_outcome;
+  check(alias_outcome("activated", false) == "activated", "an activated alias is activated");
+  check(alias_outcome("take-over-possible", false) == "take-over-possible", "an offered alias may be taken over");
+  check(alias_outcome("", false) == "refused", "an activation left out is refused");
+  check(!alias_outcome("activating", false), "an activating alias is still under way");
+  check(!alias_outcome("activating", true), "an activating alias is under way for a deactivation too");
+  check(!alias_outcome("deactivating", true), "a deactivating alias is still under way for a deactivation");
+  check(alias_outcome("deactivating", false) == "activated", "a deactivating alias is still active");
+  check(alias_outcome("", true) == "deactivated", "a deactivation left out is done");
+  check(alias_outcome("activated", true) == "activated", "a deactivation the server kept active");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.379 clauses 9.3.1.2 and 9.2.2.2.11: which listed groups of an affiliation NOTIFY count as affiliated.
+void test_counts_as_affiliated() {
+  using mcx::client_rules::counts_as_affiliated;
+  check(counts_as_affiliated("affiliated"), "an affiliated group");
+  check(counts_as_affiliated("affiliating"), "an affiliating group counts, as at the participating function");
+  check(counts_as_affiliated(""), "a group without status counts (the attribute is optional)");
+  check(!counts_as_affiliated("deaffiliating"), "a deaffiliating group does not");
+  check(!counts_as_affiliated("deaffiliated"), "nor a deaffiliated one");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.379 clause 9.2.1.5 3): an accepted negotiated-mode request affiliates to the groups not affiliated and
+// de-affiliates from those affiliated, each once; annex F.4: the groups of the <command-list>.
+void test_affiliation_change() {
+  using mcx::client_rules::affiliation_change;
+  const std::set<std::string> current{"sip:g1@x", "sip:g2@x"};
+  const auto affiliated = [&current](const std::string &group) { return current.contains(group); };
+  const auto [added, removed] =
+      affiliation_change({"sip:g1@x", "sip:g3@x", "sip:g3@x"}, {"sip:g2@x", "sip:g4@x", "sip:g2@x"}, affiliated);
+  check(added == std::vector<std::string>{"sip:g3@x"}, "a) only the groups not affiliated, once");
+  check(removed == std::vector<std::string>{"sip:g2@x"}, "b) only the groups affiliated, once");
+  const auto [none, nothing] = affiliation_change({"sip:g1@x"}, {"sip:g4@x"}, affiliated);
+  check(none.empty() && nothing.empty(), "no change when every group is as asked");
+
+  using mcx::client_rules::affiliation_command_groups;
+  const std::string command = "<?xml version=\"1.0\"?><cl:command-list xmlns:cl=\"urn:3gpp:ns:affiliationCommand:1.0\">"
+                              "<cl:affiliate><cl:group>sip:g1@x</cl:group><cl:group>sip:g2@x</cl:group></cl:affiliate>"
+                              "<cl:de-affiliate><cl:group>sip:g3@x</cl:group></cl:de-affiliate></cl:command-list>";
+  check(affiliation_command_groups(command, "affiliate") == std::vector<std::string>{"sip:g1@x", "sip:g2@x"},
+        "the <affiliate> list (prefixed)");
+  check(affiliation_command_groups(command, "de-affiliate") == std::vector<std::string>{"sip:g3@x"},
+        "the <de-affiliate> list (prefixed)");
+  const std::string plain = "<command-list xmlns=\"urn:3gpp:ns:affiliationCommand:1.0\"><de-affiliate>"
+                            "<group>sip:g5@x</group><group></group></de-affiliate></command-list>";
+  check(affiliation_command_groups(plain, "affiliate").empty(), "no <affiliate> list");
+  check(affiliation_command_groups(plain, "de-affiliate") == std::vector<std::string>{"sip:g5@x"},
+        "the <de-affiliate> list (default namespace), an empty <group> skipped");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.380 clause 14.2.5: the implicit floor request word of a call command; clause 6.2.1 item 2: not for a rejoin.
+void test_implicit_word() {
+  using mcx::client_rules::implicit_word;
+  const auto call = implicit_word("call emergency implicit");
+  check(call.command == "call emergency" && call.requested == true && call.wav.empty(), "call ... implicit");
+  const auto wav = implicit_word("private bob manual implicit=/media/talk.wav");
+  check(wav.command == "private bob manual" && wav.requested == true && wav.wav == "/media/talk.wav",
+        "private ... implicit=<WAV>");
+  const auto off = implicit_word("chat no-implicit");
+  check(off.command == "chat" && off.requested == false, "chat no-implicit");
+  check(implicit_word("adhoc bob carol implicit").command == "adhoc bob carol", "adhoc ... implicit");
+  check(implicit_word("first-to-answer bob carol implicit").requested == true, "first-to-answer ... implicit");
+  check(!implicit_word("call").requested && implicit_word("call").command == "call", "no word: unchanged");
+  const auto upgrade = implicit_word("emergency on alert implicit=/media/u.wav");
+  check(upgrade.command == "emergency on alert" && upgrade.requested == true && upgrade.wav == "/media/u.wav",
+        "emergency on alert implicit=<WAV>");
+  check(implicit_word("imminent on implicit").command == "imminent on", "imminent on implicit");
+  check(!implicit_word("emergency off implicit").requested, "a cancellation is no implicit floor request");
+  check(!implicit_word("call emergency").requested, "another last word: unchanged");
+  check(!implicit_word("ptt implicit").requested && implicit_word("ptt implicit").command == "ptt implicit",
+        "not a call command: unchanged");
+  check(!implicit_word("call implicit=").requested, "implicit= without a WAV is no choice");
+  check(implicit_word("rejoin implicit").rejoin && !implicit_word("rejoin implicit").requested,
+        "a rejoin is never an implicit floor request");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.380 clause 14.4: an answer's fmtp parameter the offer lacked is discarded.
+void test_answer_parameters() {
+  using mcx::client_rules::answer_parameter_kept;
+  check(answer_parameter_kept(true, true), "an offered parameter the answer returns is kept");
+  check(!answer_parameter_kept(true, false), "an unoffered parameter is discarded");
+  check(!answer_parameter_kept(false, true), "a parameter the answer leaves out is not negotiated");
+}
+
+//------------------------------------------------------------------------------
+// TS 33.180 clauses 7.3.4, 7.3.11 and 7.3.12: the GMK of a call's group: a regroup's preconfigured group, else the
+// group's own; the newest usable key of that group, none for a group without one.
+void test_call_key_group() {
+  using mcx::client_rules::key_group;
+  using mcx::client_rules::newest_usable;
+  const auto preconfigured = [](const std::string &group) {
+    return group == "sip:regroup@x" ? std::string("sip:pre@x") : std::string{};
+  };
+  check(key_group("sip:regroup@x", preconfigured) == "sip:pre@x", "a regroup is keyed with its preconfigured group");
+  check(key_group("sip:monitored@x", preconfigured) == "sip:monitored@x", "a monitored group with its own GMK");
+  check(key_group("sip:broadcast@x", preconfigured) == "sip:broadcast@x", "a broadcast group with its own GMK");
+  struct Key {
+    std::string group;
+    unsigned activation;
+  };
+  const std::map<unsigned, Key> keys{
+      {1, {"sip:selected@x", 10}}, {2, {"sip:pre@x", 20}}, {3, {"sip:pre@x", 30}}, {4, {"sip:selected@x", 40}}};
+  const auto of = [&](const std::string &group) {
+    return newest_usable(keys, [&](const Key &key) { return key.group == group; },
+                         [](const Key &key) { return key.activation; });
+  };
+  check(of("sip:pre@x") && of("sip:pre@x")->activation == 30, "the newest GMK of the preconfigured group");
+  check(of("sip:selected@x") && of("sip:selected@x")->activation == 40, "the selected group's GMK, not another's");
+  check(!of("sip:other@x"), "no GMK for a group without one: the call is refused, not keyed with another's");
+}
+
+//------------------------------------------------------------------------------
+// TS 33.180 annex E.6.10: an MCData PCK context ends at the earlier of the local lifetime and the PCK's own Expiry
+// time (0: none); with an Expiry time 1 s ahead it is usable now and gone at that time (expire_data_keys drops a
+// context once its end is reached).
+void test_data_pck_end() {
+  using mcx::client_rules::data_pck_end;
+  const std::uint64_t now = 2000000000, local = now + 3600;
+  check(data_pck_end(local, 0) == local, "PCK without Expiry time: the local lifetime");
+  check(data_pck_end(local, now + 7200) == local, "later Expiry time: the local lifetime");
+  const auto end = data_pck_end(local, now + 1);
+  check(end == now + 1, "earlier Expiry time ends the context");
+  check(end > now, "usable 1 s before its Expiry time");
+  check(!(end > now + 1), "not usable at its Expiry time");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.380 clauses 14.2.7, 14.3.8 and 8.2.4: the floor control SSRCs with and without multiplexing.
+void test_floor_multiplexing() {
+  using namespace mcx::client_rules;
+  check(floor_ssrc_to_send(11, 22) == 22, "multiplexed: the server's mc_floor_ssrc is sent");
+  check(floor_ssrc_to_send(11, 0) == 11, "not multiplexed: this client's own SSRC is sent");
+  check(floor_ssrc_received(11, 11, 22) && !floor_ssrc_received(33, 11, 22),
+        "multiplexed: only this client's mc_floor_ssrc is taken");
+  check(floor_ssrc_received(33, 11, 0) && floor_ssrc_received(11, 11, 0),
+        "not multiplexed: the server's own SSRC is taken");
+  check(answer_floor_ssrc(11, 22) == 11, "an offer with mc_floor_ssrc is answered with one");
+  check(answer_floor_ssrc(11, 0) == 0, "an offer without mc_floor_ssrc is answered without one (14.3.1, 14.3.8)");
+  // TS 24.380 14.3.2, 14.3.3, 14.3.7: the answer's fmtp parameters item by item, not a mirror of the offer.
+  const auto plain = answer_floor_parameters(true, 11, true, false, 0, std::uint8_t{3});
+  check(plain.queueing && plain.floor_priority == 3 && plain.floor_ssrc == 0,
+        "offer mc_priority=3 only: answered mc_priority=3;mc_queueing (14.3.2, 14.3.3, 14.3.8)");
+  const auto no_queue = answer_floor_parameters(true, 11, false, false, 22, std::nullopt);
+  check(!no_queue.queueing && !no_queue.floor_priority && no_queue.floor_ssrc == 11,
+        "queueing unsupported: no mc_queueing; no offered mc_priority: none returned");
+  const auto uncontrolled = answer_floor_parameters(true, 11, true, true, 22, std::uint8_t{3});
+  check(!uncontrolled.queueing && !uncontrolled.floor_priority && uncontrolled.floor_ssrc == 11,
+        "mc_no_floor_ctrl: no floor control related parameter (14.2.6, 14.3.7)");
+  const auto no_channel = answer_floor_parameters(false, 11, true, false, 0, std::nullopt);
+  check(!no_channel.queueing && !no_channel.floor_priority && no_channel.floor_ssrc == 0,
+        "an offer without the media plane control channel: no fmtp parameter (TS 24.379 6.2.2, TS 24.380 14.3.1)");
+
+  // TS 24.380 14.2.7: mc_floor_ssrc in an offer only if multiplexing is supported.
+  check(offer_floor_ssrc(11, true) == 11, "multiplexing supported: the offer has this client's mc_floor_ssrc");
+  check(offer_floor_ssrc(11, false) == 0, "multiplexing not supported: the offer has no mc_floor_ssrc (14.2.7)");
+  // TS 24.380 14.3.8: in an answer only if multiplexing is supported and the offer had one.
+  check(answer_floor_ssrc(11, 22, false) == 0, "multiplexing not supported: an offer's mc_floor_ssrc unanswered");
+  check(answer_floor_ssrc(11, 22, true) == 11 && answer_floor_ssrc(11, 0, true) == 0,
+        "multiplexing supported: answered with mc_floor_ssrc only when offered");
+  const auto unmultiplexed = answer_floor_parameters(true, 11, true, false, 22, std::uint8_t{3}, false);
+  check(unmultiplexed.floor_ssrc == 0 && unmultiplexed.queueing && unmultiplexed.floor_priority == 3,
+        "multiplexing not supported: the answer's other parameters as with it, no mc_floor_ssrc (14.3.8)");
+  // TS 24.380 14.4, TS 24.379 6.2.10: the server's mc_floor_ssrc used only with this client's support.
+  check(negotiated_floor_ssrc(22, true) == 22 && negotiated_floor_ssrc(0, true) == 0,
+        "multiplexing supported: the server's mc_floor_ssrc, if any, kept");
+  check(negotiated_floor_ssrc(22, false) == 0,
+        "multiplexing not supported: an answer's mc_floor_ssrc the offer lacked is discarded (14.4)");
+
+  // The offering side (CO) without multiplexing, end to end: offer without mc_floor_ssrc, the server's answer
+  // with none (or one, discarded): the floor control messages go with this client's own SSRC and the server's,
+  // carrying its own SSRC, are taken by its address and port (TS 24.380 8.2.4).
+  for (const std::uint32_t answered : {0u, 22u}) {
+    const std::uint32_t own = 11;
+    const auto offered = offer_floor_ssrc(own, false);
+    const auto remote = negotiated_floor_ssrc(answered, false);
+    check(offered == 0 && floor_ssrc_to_send(own, remote) == own,
+          "CO, not multiplexed: Floor Request and Release with this client's own SSRC");
+    check(floor_ssrc_received(33, own, remote), "CO, not multiplexed: the server's Floor Granted with its SSRC taken");
+  }
+  // The offering side (CO) with multiplexing, the server answering without mc_floor_ssrc (14.3.8): not multiplexed.
+  check(floor_ssrc_to_send(11, negotiated_floor_ssrc(0, true)) == 11 &&
+            floor_ssrc_received(33, 11, negotiated_floor_ssrc(0, true)),
+        "CO, multiplexing supported, answer without mc_floor_ssrc: not multiplexed");
+  // The default (multiplexing supported, the server answering with mc_floor_ssrc) unchanged.
+  check(floor_ssrc_to_send(11, negotiated_floor_ssrc(22, true)) == 22 &&
+            !floor_ssrc_received(33, 11, negotiated_floor_ssrc(22, true)),
+        "CO, multiplexed: the server's mc_floor_ssrc sent, only this client's taken");
+}
+
+//------------------------------------------------------------------------------
+// RFC 3711 section 3.4: the floor control streams of the call under way, both directions, go on under a new CSK.
+void test_call_floor_ssrcs() {
+  using mcx::client_rules::call_floor_ssrcs;
+  check(call_floor_ssrcs(7, 9) == std::set<std::uint32_t>{7, 9}, "both directions of the call go on");
+  check(call_floor_ssrcs(7, std::nullopt) == std::set<std::uint32_t>{7}, "before the answer: this client's SSRC");
+  check(call_floor_ssrcs(0, std::nullopt).empty(), "no call: none");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.229 clauses 5.1.1.3, 5.1.1.4.1 and 5.1.1.5A.
+void test_reg_event_rules() {
+  using mcx::client_rules::contact_address;
+  using mcx::client_rules::refresh_delay_s;
+  check(refresh_delay_s(600000, 600000) == 599400, "a long subscription is refreshed 600 s before its expiry");
+  check(refresh_delay_s(3600, 1000) == 400, "a long subscription keeps the 600 s rule late in its life");
+  check(refresh_delay_s(1200, 1200) == 600, "a subscription of 1200 s is refreshed at half time");
+  check(refresh_delay_s(60, 60) == 30, "a short registration is refreshed at half time");
+  check(refresh_delay_s(3600, 120) == 0, "a shortened long registration is renewed at once");
+  check(refresh_delay_s(600, 120) == 0, "a shortened short registration past half time is renewed at once");
+  check(contact_address("<sip:alice@192.0.2.1:5064;transport=tcp>;expires=60") == "alice@192.0.2.1:5064",
+        "contact address from a Contact value");
+  check(contact_address("sips:alice@192.0.2.1:5061;ob") == "alice@192.0.2.1:5061", "contact address of a SIPS URI");
+  check(contact_address("sip:alice@[2001:db8::1]:5064") == "alice@[2001:db8::1]:5064", "contact address with IPv6");
+
+  // TS 24.229 clauses 5.1.1.5A and 5.1.1.7 with RFC 3680 section 5.1: the contact "belonging to this UE" by address and
+  // the Call-ID of the current registration (BR-01: a restarted client at client-c:5060 reading the binding its log-off
+  // removed).
+  using mcx::client_rules::own_reg_contact;
+  const auto self = "sip:client-c@client-c:5060;transport=tcp";
+  check(own_reg_contact("sip:client-c@client-c:5060;transport=tcp", "new-call", self, "new-call"),
+        "own contact: same address and Call-ID");
+  check(!own_reg_contact("sip:client-c@client-c:5060;transport=tcp", "old-call", self, "new-call"),
+        "an earlier registration at the same address is not this client's");
+  check(own_reg_contact("<sip:client-c@client-c:5060>", "", self, "new-call"),
+        "a contact without callid matches by address");
+  check(own_reg_contact("sip:client-c@client-c:5060", "old-call", self, ""),
+        "before a registration's Call-ID is known the address decides");
+  check(!own_reg_contact("sip:client-c@client-d:5060", "new-call", self, "new-call"),
+        "another address is not this client's whatever its callid");
+
+  // RFC 3680 section 5.1: the binding's state from before the current REGISTER under the same Call-ID (BR-04: the
+  // first NOTIFY after log-on still lists the binding the log-off removed, cseq 2, the registration's CSeq being 6).
+  using mcx::client_rules::stale_reg_contact;
+  check(stale_reg_contact("call", 2, "call", 6), "a lower cseq under the same Call-ID is stale");
+  check(!stale_reg_contact("call", 6, "call", 6), "the current registration's cseq is not stale");
+  check(!stale_reg_contact("call", 7, "call", 6), "a later cseq (a network deregistration) is not stale");
+  check(!stale_reg_contact("other", 2, "call", 6), "CSeq numbers of another Call-ID do not compare");
+  check(!stale_reg_contact("", 2, "call", 6), "without callid the cseq does not compare");
+  check(!stale_reg_contact("call", std::nullopt, "call", 6), "without cseq nothing is stale");
+  check(!stale_reg_contact("call", 2, "call", 0), "before a registration's CSeq is known nothing is stale");
+  using mcx::client_rules::cseq_number;
+  check(cseq_number("6 REGISTER") == 6 && cseq_number(" 28845 REGISTER") == 28845, "CSeq sequence number");
+  check(cseq_number("") == 0 && cseq_number("REGISTER") == 0 && cseq_number("12x REGISTER") == 0,
+        "no sequence number in a malformed CSeq");
+
+  // RFC 6665 section 4.1.3: a reg NOTIFY on a dialog other than the current subscription's is answered 481.
+  using mcx::client_rules::classify_reg_notify;
+  using mcx::client_rules::RegNotify;
+  check(classify_reg_notify("reg", "sub-1", "sub-1") == RegNotify::current, "reg NOTIFY of the current subscription");
+  check(classify_reg_notify(" reg ;id=7", "sub-1", "sub-1") == RegNotify::current, "Event parameters are ignored");
+  check(classify_reg_notify("reg", "old-sub", "sub-1") == RegNotify::unknown,
+        "reg NOTIFY of an earlier process's subscription");
+  check(classify_reg_notify("reg", "old-sub", "") == RegNotify::unknown, "reg NOTIFY with no subscription");
+  check(classify_reg_notify("reg", "", "") == RegNotify::unknown, "reg NOTIFY without a dialog");
+  check(classify_reg_notify("presence", "sub-1", "sub-1") == RegNotify::other_package, "another event package");
+  check(classify_reg_notify("registration", "sub-1", "sub-1") == RegNotify::other_package,
+        "an event type that only begins with reg");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 15.2.13: hex Payload data and the TS 23.032 clause 6.1 LOCATION payload.
+static void test_sds_payloads() {
+  using namespace mcx::client_rules;
+  check(hex_bytes("00ff7a") == std::string("\x00\xff\x7a", 3) && hex_text(std::string("\x00\xff\x7a", 3)) == "00ff7a",
+        "hex payload data round trip");
+  bool refused = false;
+  try {
+    (void)hex_bytes("abc");
+  } catch (const std::invalid_argument &) {
+    refused = true;
+  }
+  check(refused, "odd hex refused");
+  // 45 N: 2^22; 90 E: 2^22 (2^24 / 4); 45 S: sign bit and 2^22; 90 W: 2^24 - 2^22.
+  check(hex_text(location_payload("45,90")) == "400000400000", "45 N 90 E");
+  check(hex_text(location_payload("-45,-90")) == "c00000c00000", "45 S 90 W");
+}
+
+int main() {
+  test_call_floor_ssrcs();
+  test_floor_multiplexing();
+  test_call_key_group();
+  test_data_pck_end();
+  test_notifiers();
+  test_has_warning();
+  test_refresh_refusal();
+  test_token_renewal();
+  test_oidc_scope();
+  test_percent_decode();
+  test_control_unescape();
+  test_profile_groups();
+  test_floor_and_audio();
+  test_rtp_sequence();
+  test_authorization_retry();
+  test_alias_outcome();
+  test_counts_as_affiliated();
+  test_affiliation_change();
+  test_implicit_word();
+  test_answer_parameters();
+  test_reg_event_rules();
+  test_mc_priorities();
+  test_sds_payloads();
+  if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
+  return failures ? 1 : 0;
+}

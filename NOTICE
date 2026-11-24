@@ -1,0 +1,53 @@
+OpenMCX clients: the Linux client (linux/), the dispatcher (dispatcher/) and the Android app (android/)
+Copyright (C) 2026 the OpenMCX authors
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
+Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any
+later version. See LICENSE.
+
+Contact: contact@openmcx.com
+
+The source code of each published version, and of the APK and images built from it, is at
+https://github.com/openMCX/openmcx-client.
+
+Third-party software
+--------------------
+Linux client (linux/), built with the openmcx-server sources and their libraries (see openmcx-server NOTICE):
+
+  reSIProcate 1.14.0       Vovida Software License 1.0 (BSD-style)   https://github.com/resiprocate/resiprocate
+                           from OpenMCX's fork https://github.com/openMCX/resiprocate (tag openmcx-1.14.0-1, with
+                           OpenMCX's patch); its bundled resolver (rutil/dns/ares) is under the MIT-style c-ares
+                           licence. Licence text in images as resiprocate-LICENSE.md
+  hostap MILENAGE (hostap_2_11 src/crypto/milenage.c, the IMS AKA ISIM)
+                           BSD-3-Clause             https://w1.fi/hostap/
+                           Copyright (c) 2006-2007 Jouni Malinen; licence text in images as hostap-README
+  libsrtp 2.8.1            BSD-3-Clause             https://github.com/cisco/libsrtp
+                           with OpenMCX's patch in openmcx-server dependencies/libsrtp (the first SRTCP index is zero)
+  OpenH264                 BSD-2-Clause             https://github.com/cisco/openh264
+  opencore-amr, vo-amrwbenc  Apache-2.0             https://sourceforge.net/projects/opencore-amr/
+  nlohmann/json, libxml2   MIT                      https://github.com/nlohmann/json, https://gitlab.gnome.org/GNOME/libxml2
+  OpenSSL 3                Apache-2.0               https://www.openssl.org
+
+Dispatcher (dispatcher/):
+
+  Go standard library      BSD-3-Clause             https://go.dev
+  golang.org/x/net         BSD-3-Clause             https://go.googlesource.com/net
+  and the Linux client above, as its engine
+
+Android app (android/), libraries pinned in android/gradle/libs.versions.toml:
+
+  Kotlin standard library, kotlinx.coroutines, kotlinx.serialization
+                           Apache-2.0               https://github.com/JetBrains
+  AndroidX (core, core-telecom, lifecycle, activity, browser, Compose, Material 3)
+                           Apache-2.0               https://developer.android.com/jetpack/androidx
+  zxing-android-embedded and ZXing
+                           Apache-2.0               https://github.com/journeyapps/zxing-android-embedded
+  The app uses Android's own AMR-WB and H.264 codecs (MediaCodec); it bundles no codec.
+
+
+Virtuser MCX
+------------
+This is a modified version of the OpenMCX client by Virtuser Business Comms Services Ltd (virtuser.com),
+November 2026: Android app renamed "Virtuser MCX" (application ID com.virtuser.mcx), Virtuser logo and colours,
+About text, a test signing key and a GitHub build workflow. All changes are under the same AGPL-3.0-or-later licence.
+Original project: https://github.com/openMCX/openmcx-client

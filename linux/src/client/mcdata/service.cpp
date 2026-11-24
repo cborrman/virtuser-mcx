@@ -1,0 +1,929 @@
+//
+// OpenMCX Licence Information : AGPL-3.0-or-later
+//
+
+// MCData service authorisation, affiliation, enhanced status and standalone SDS over the signalling control plane,
+// MCData client side (member functions of Client).
+//
+// Specifications: TS 24.282 V19.7.0 (Rel-19), TS 24.481 V19.3.0 (Rel-19), TS 33.180 V19.4.0 (Rel-19),
+// RFC 3428 (SIP MESSAGE), RFC 3903 (SIP PUBLISH), RFC 6665 (SIP SUBSCRIBE and NOTIFY).
+
+#include "client.hpp"
+
+namespace mcx {
+
+//------------------------------------------------------------------------------
+// Helper: append an entry to a status list, keeping the last 50.
+void Client::bounded_push(Json &list, Json entry) {
+  list.push_back(std::move(entry));
+  while (list.size() > 50) list.erase(list.begin());
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 6.2.4.1 step 1: the media feature tags and ICSI of a SIP MESSAGE request for SDS.
+std::vector<SipHeader> Client::mcdata_sds_headers() const {
+  return {{"Accept-Contact", "*;+g.3gpp.mcdata.sds;require;explicit"},
+          {"Accept-Contact", "*;+g.3gpp.icsi-ref=\"" + url_encode(mcdata::sds_icsi) + "\";require;explicit"},
+          {"P-Preferred-Service", mcdata::sds_icsi}};
+}
+
+//------------------------------------------------------------------------------
+// Helper: send an MCData SIP request to the participating MCData function with the MCData
+// ICSI (TS 24.282 clause 7.2.1A step 2) and its bodies protected (TS 24.282 clauses 6.5.2 and 6.6.3).
+void Client::mcdata_request(const std::string &event_name, std::vector<BodyPart> parts, std::vector<SipHeader> headers,
+                            std::function<void(const SipResponse &)> done, const std::string &method) {
+  const auto boundary = "mcdata-" + random_id();
+  parts = mcdata_seal_signalling(std::move(parts));
+  headers.push_back({"P-Preferred-Service", mcdata::icsi});
+  if (!event_name.empty()) headers.push_back({"Event", event_name});
+  const auto [type, body] = message_body(parts, boundary);
+  sip_.request(method, mcdata_service(), type, body, headers, [this, done](const SipResponse &response) {
+    if (response.status_code >= 200) done(mcdata_opened_response(response));
+  });
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 7.2.2: service authorisation and MCData service settings by PUBLISH; with
+// mcptt.authorise_by_register, clause 7.2.1: the mcdata-info (and the CSK upload) in a REGISTER of its own, which the
+// SIP core passes to the MCData server in a third-party REGISTER (clause 7.3.2).
+void Client::mcdata_authorize() {
+  if (!mcdata_enabled() || token_.empty() || logged_off_) return;
+  const bool by_register = authorise_by_register();
+  mcdata::Info info;
+  info.access_token = token_;
+  info.client_id = client_id();
+  // TS 24.282 clauses 7.2.1 3) / 2)c) / 3)c) and 7.2.2 4)c) / 5)c): <gw-mcdata-usage> true when the client reaches the
+  // MCData system through an MCData gateway UE (mcdata.via_gateway_ue, a deployment setting).
+  info.gateway_usage = cfg_.at("mcdata").value("via_gateway_ue", false);
+  std::vector<SipHeader> headers{{"Expires", "4294967295"}};
+  const bool refresh = !mcdata_auth_etag_.empty();
+  if (refresh) headers.push_back({"SIP-If-Match", mcdata_auth_etag_});
+  std::vector<BodyPart> parts{{mcdata::info_mime, mcdata::info_xml(info)}};
+  // TS 24.282 clause 7.2.2 6): the selected MCData user profile (no answer mode in MCData).
+  if (!by_register) parts.push_back({"application/poc-settings+xml", mcdata_poc_settings()});
+  // TS 24.282 clause 7.2.2 step 3: the CSK, once, in the first service authorisation.
+  const bool uploading = !mcdata_csk_accepted_ && !mcdata_csk_upload_.empty();
+  if (uploading) {
+    // TS 24.282 clause 7.2.2 step 4: the access token and client ID encrypted with the CSK being uploaded.
+    parts = mcdata_encrypt_xml(std::move(parts), mcdata_xml_key(true));
+    parts.push_back({"application/mikey", mcdata_csk_upload_});
+  }
+  ++mcdata_authorization_retry_.generation;
+  auto answered = [this, uploading, refresh](const SipResponse &response) {
+    if (response.status_code != 200) {
+      // TS 24.282 clause 7.2.2: not authorised, and so not affiliated.
+      mcdata_authorized_ = mcdata_affiliated_ = false;
+      failure("MCData service authorisation: " + std::to_string(response.status_code));
+      // RFC 3903 section 5: after a 412 to a refresh, discard the entity-tag and publish anew; the affiliation
+      // status subscription and the affiliation follow the new authorisation. A refresh refused for a reason that can
+      // be transient (the SIP core answering while the server restarts, for example) is handled alike, the initial
+      // publication following after a growing delay.
+      const bool transient = client_rules::transient_authorization_refusal(response.status_code);
+      if (refresh && (response.status_code == 412 || transient)) {
+        mcdata_auth_etag_.clear();
+        mcdata_affiliation_etag_.clear();
+        mcdata_subscription_.clear();
+        // TS 24.282 clause 22.2.2.3.6: the server ended the aliases with the authorisation, and its subscriptions.
+        mcdata_alias_dialog_.clear();
+        mcdata_alias_answered_ = false;
+        mcdata_aliases_active_.clear();
+        mcdata_aliases_standing_.clear();
+        mcdata_alias_publish_open_.clear();
+      }
+      if (refresh && response.status_code == 412) {
+        schedule([this] { mcdata_authorize(); });
+      } else if (!refresh || transient) {
+        // A refused publication is published again when the refusal can be transient.
+        retry_authorization(mcdata_authorization_retry_, "mcdata", response, [this] {
+          if (!mcdata_authorized_) mcdata_authorize();
+        });
+      }
+      return;
+    }
+    mcdata_auth_etag_ = get_header(response.headers, "SIP-ETag");
+    mcdata_authorization_retry_.attempts = 0;
+    mcdata_authorized_ = true;
+    if (uploading) {
+      mcdata_csk_accepted_ = true;
+      mcdata_csk_upload_.clear();
+    }
+    event("mcdata_service_authorized");
+    mcdata_location_logon_pending_ = !mcdata_location_.configured();
+    mcdata_location_.signal(location::Event::InitialLogOn, monotonic_ms());
+    // TS 24.282 clause 8.2.3: learn the affiliation status (including implicit affiliations)
+    // first; the affiliation PUBLISH follows the first NOTIFY.
+    if (mcdata_subscription_.empty())
+      schedule([this] { mcdata_subscribe(); });
+    else if (mcdata_desired_affiliation_)
+      schedule([this] { mcdata_affiliate(true); });
+  };
+  if (by_register) {
+    const auto [type, body] = message_body(mcdata_seal_signalling(std::move(parts)), "mcdata-" + random_id());
+    queue_register(type, body, answered);
+    event("mcdata_service_authorization_by_register");
+  } else {
+    mcdata_request("poc-settings", parts, headers, answered);
+  }
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 8.2.3: SUBSCRIBE to the affiliation status of an MCData user (by default this
+// user) at the MCData server; Expires 0 fetches the current state once.
+std::string Client::mcdata_status_subscribe(const std::string &target, bool fetch) {
+  mcdata::Info info;
+  info.request_uri = target;
+  return sip_.subscribe(
+      mcdata_service(), "presence", fetch ? 0u : 4294967295u,
+      {{"P-Preferred-Service", mcdata::icsi}, {"Accept", "application/pidf+xml"}},
+      [this, fetch, target](const SipResponse &response) {
+        if (response.status_code < 200) return;
+        if (fetch) {
+          if (response.status_code >= 300)
+            mcdata_fetch_result_ = {{"target", target}, {"status", response.status_code}, {"groups", nullptr}};
+          return;
+        }
+        if (response.status_code >= 300) {
+          mcdata_subscription_.clear();
+          failure("MCData affiliation subscription: " + std::to_string(response.status_code));
+        }
+      },
+      mcdata::info_mime,
+      mcdata_encrypt_xml({{mcdata::info_mime, mcdata::info_xml(info)}}, mcdata_xml_key()).front().body);
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 8.2.3: subscribe to this user's own affiliation status, once service authorisation succeeded.
+void Client::mcdata_subscribe() {
+  if (!mcdata_authorized_ || !mcdata_subscription_.empty()) return;
+  mcdata_status_known_ = false;
+  mcdata_subscription_ = mcdata_status_subscribe(mcdata_user(), false);
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 8.2.3: NOTIFY with the per-user affiliation information (TS 24.282 clause 8.4.1).
+SipResponse Client::mcdata_affiliation_notify(const SipMessage &request) {
+  SipResponse response;
+  response.status_code = 200;
+  if (asserted_identity(request) != mcdata_service()) {
+    response.status_code = 403;
+    return response;
+  }
+  if (get_header(request.headers, "Event") != "presence") {
+    response.status_code = 489;
+    return response;
+  }
+  const bool fetch = request.dialog_id == mcdata_fetch_;
+  const bool terminated = get_header(request.headers, "Subscription-State").starts_with("terminated");
+  const auto body = request.parts.empty() ? request.body : request.parts.front().body;
+  // TS 24.282 clause 8.4.1: one tuple per client; a subscription reads this client's (none: no group), a fetch of
+  // another user's status the one tuple of the answer.
+  const auto affiliation = fetch ? parse_affiliation(body) : parse_affiliation(body, client_id());
+
+  // An empty status has no <affiliation> element to show its namespace.
+  if (!affiliation.mcdata && !affiliation.groups.empty())
+    throw std::runtime_error("MCData affiliation NOTIFY without the MCData namespace");
+  // TS 24.282 clause 8.4.1 (TS 24.379 clause 9.2.2.2.11): the listed groups not being given up, also the base of the
+  // next whole-set PUBLISH (one still "affiliating", left out, would be deaffiliated).
+  std::set<std::string> groups;
+  for (std::size_t index = 0; index < affiliation.groups.size(); ++index)
+    if (client_rules::counts_as_affiliated(index < affiliation.statuses.size() ? affiliation.statuses[index] : ""))
+      groups.insert(affiliation.groups[index]);
+  if (fetch) {
+    mcdata_fetch_result_ = {
+        {"target", affiliation.user_id}, {"status", 200}, {"groups", groups}, {"terminated", terminated}};
+    mcdata_fetch_.clear();
+    return response;
+  }
+  if (affiliation.user_id != mcdata_user() || affiliation.client_id != client_id())
+    throw std::runtime_error("MCData NOTIFY identity mismatch");
+  mcdata_groups_ = groups;
+  mcdata_affiliated_ = groups.contains(mcdata_group());
+  if (!affiliation.publication_id.empty()) mcdata_received_pid_ = affiliation.publication_id;
+  event("mcdata_affiliation_status",
+        {{"groups", groups}, {"p_id", affiliation.publication_id}, {"terminated", terminated}});
+  if (terminated) {
+    mcdata_subscription_.clear();
+    mcdata_status_known_ = false;
+    return response;
+  }
+  if (!mcdata_status_known_) {
+    mcdata_status_known_ = true;
+    if (mcdata_desired_affiliation_ && !mcdata_affiliated_) schedule([this] { mcdata_affiliate(true); });
+  }
+  return response;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 8.2.2: affiliation status change of this user at this client: affiliate: the groups the user is
+// interested in (the configured MCData group, the groups the server reports as affiliated, e.g. implicit affiliations,
+// and those joined with mcdata-affiliate <group>: mcdata_interest); not affiliate: no longer interested in any group
+// (Expires 0, no PIDF, steps 4 and NOTE 1). The PUBLISH: mcdata/settings_affiliation.cpp.
+void Client::mcdata_affiliate(bool affiliate) {
+  if (!mcdata_authorized_) throw std::runtime_error("MCData affiliation requires MCData service authorisation");
+  mcdata_desired_affiliation_ = affiliate;
+  if (!affiliate) {
+    mcdata_extra_groups_.clear();
+    mcdata_left_groups_.clear();
+    mcdata_publish_affiliation({}, true);
+    return;
+  }
+  // A user may belong to no MCData group (an account activated without one): nothing to publish.
+  if (mcdata_interest({}).empty()) return;
+  mcdata_publish_affiliation({});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 14.2.1.1 with TS 24.481: the <mcdata-allow-enhanced-status> element and the
+// <mcdata-enhanced-status-operational-values> of a group, read from the group document (cached unless refreshed).
+const EnhancedStatusValues &Client::mcdata_group_status_values(const std::string &group, bool refresh) {
+  if (!refresh)
+    if (const auto found = mcdata_enhanced_values_.find(group); found != mcdata_enhanced_values_.end())
+      return found->second;
+  auto document = http_.request("GET",
+                                groups_xcap() + "/global/byGroupID/" + xcap_segment(group),
+                                {}, {{"Authorization", bearer()}});
+  if (document.status != 200)
+    throw std::runtime_error("group document retrieval failed: " + std::to_string(document.status));
+  return mcdata_enhanced_values_[group] = group_enhanced_status(document.body);
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 14.2.1.1: the selected operational value's "id" goes to the group as a
+// standalone SDS whose payload content type is ENHANCED STATUS.
+// "force" skips the checks, so that a test can send an id the group does not know.
+void Client::mcdata_send_enhanced_status(const std::string &group, const std::string &id, bool force,
+                                         mcdata::DispositionRequest disposition) {
+  const auto &values = mcdata_group_status_values(group, true);
+  if (!force && !values.allowed) throw std::runtime_error("enhanced status is not allowed on this group");
+  if (!force &&
+      std::none_of(values.values.begin(), values.values.end(), [&id](const auto &value) { return value.first == id; }))
+    throw std::runtime_error("no operational value with that id in the group document");
+  SdsRequest request;
+  request.type = "group-sds";
+  request.target = group;
+  request.text = id;
+  request.content = mcdata::ContentType::EnhancedStatus;
+  request.disposition = disposition;
+  mcdata_send_sds(request);
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 9.2.2.2.1 step 3A and clause 24.2.2.1.1 steps 5e ii, 7 and 8: an ad hoc group is named
+// by a participant list ("ID,ID,..."), by criteria ("criteria=<criteria>") or by
+// the identity of an ad hoc group already created ("group=<ad hoc group>").
+// Returns the participants to list in an application/resource-lists+xml body.
+std::vector<std::string> Client::mcdata_adhoc_target(const std::string &spec, mcdata::Info &info) const {
+  require_mcdata_profile({"allow-adhoc-group-data-comn"});
+  std::vector<std::string> participants;
+  if (spec.starts_with("criteria="))
+    info.participant_criteria = spec.substr(9);
+  else if (spec.starts_with("group="))
+    info.request_uri = spec.substr(6);
+  else {
+    std::istringstream list(spec);
+    for (std::string id; std::getline(list, id, ',');)
+      if (!id.empty()) participants.push_back(id);
+  }
+  if (participants.empty() && info.participant_criteria.empty() && info.request_uri.empty())
+    throw std::runtime_error("an ad hoc group needs MCData IDs, criteria=<criteria> or group=<ad hoc group>");
+  return participants;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 24.2.2.1.1, on a SIP 2xx response, step 4: the 2xx names the ad hoc group in
+// <mcdata-calling-group-id>.
+void Client::mcdata_adhoc_answered(const SipResponse &response) {
+  for (const auto &part : response.parts) {
+    if (part.content_type != mcdata::info_mime) continue;
+    const auto answer = mcdata::parse_info(part.body);
+    if (answer.calling_group.empty()) continue;
+    mcdata_media_result_["group"] = answer.calling_group;
+    if (mcdata_media_session_) mcdata_session_group_ = answer.calling_group;
+    event("mcdata_adhoc_group_learned", {{"group", answer.calling_group}});
+  }
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 9.2.2.2.1: the MCData client sends a one-to-one, group or ad hoc group standalone SDS over the
+// signalling control plane, protected with the PCK or GMK (TS 24.282 clause 6.6.3.2) and optionally signed; a SIP 300
+// (Multiple Choices) response to a functional alias target sends it again to the selected MCData ID.
+void Client::mcdata_send_sds(const SdsRequest &request) {
+  if (!mcdata_authorized_) throw std::runtime_error("SDS requires MCData service authorisation");
+  require_mcdata_profile({"allow-transmit-data"}); // TS 24.282 clause 11.1 step 1
+  mcdata::Info info;
+  info.request_type = request.type;
+  std::vector<std::string> participants;
+  if (request.type == "group-sds") {
+    info.request_uri = request.target;
+    info.client_id = client_id();
+    info.associated_group = mcdata_associated_group(request.target); // TS 24.282 clause 9.2.2.2.1 3)b)iii)
+  } else if (request.type == "ad-hoc-group-sds") {
+    info.client_id = client_id();
+    participants = mcdata_adhoc_target(request.target, info);
+    // TS 24.282 clause 9.2.2.2.1 3A)a)iv)A): the preconfigured MCData group ID stored by an ad hoc group
+    // determination (24.2.7.2)
+    if (mcdata_adhoc_determined_.is_object())
+      info.preconfigured_group = mcdata_adhoc_determined_.value("preconfigured_group", std::string{});
+  } else if (request.to_alias) {
+    info.call_to_functional_alias = true; // TS 24.282 clause 9.2.2.2.1 step 2b ii A
+  }
+  info.called_functional_alias = request.called_alias;
+
+  // TS 24.282 clause 9.2.2.2.1 steps 2b ii B and 3b v A: present an alias only while it is active for this user.
+  if (!mcdata_alias_in_use_.empty() && mcdata_aliases_active_.contains(mcdata_alias_in_use_))
+    info.functional_alias = mcdata_alias_in_use_;
+  info.user_requested_priority = request.priority; // TS 24.282 clause 9.2.2.2.1 steps 2b ii C and 3b v B
+  mcdata::SdsSignalling signalling;
+  signalling.date_time = static_cast<std::uint64_t>(std::time(nullptr));
+  signalling.conversation = request.conversation.value_or(mcdata::random_uuid());
+  signalling.message = mcdata::random_uuid();
+  signalling.in_reply_to = request.in_reply_to;
+  signalling.application_id = request.application;
+  signalling.extended_application_id = request.extended_application; // TS 24.282 clause 6.2.2.1 step 7b
+  signalling.application_metadata = request.metadata;                 // TS 24.282 clause 6.2.2.1 step 12
+  signalling.disposition = request.disposition;
+  mcdata::DataPayload payload{{{request.content, request.text}}};
+  std::vector<BodyPart> parts{{mcdata::info_mime, mcdata::info_xml(info)}};
+  if (request.type == "one-to-one-sds")
+    parts.push_back({resource_lists_mime, private_call_resource_list(request.target)});
+  if (!participants.empty()) parts.push_back({resource_lists_mime, resource_list_xml(participants)});
+  parts.push_back({mcdata::signalling_mime, mcdata::encode(signalling)});
+  auto data = mcdata::encode(payload);
+  const std::optional<std::uint32_t> dppk = mcdata_protect_sds(request, parts, data);
+  data = mcdata_sign(data); // TS 33.180 clause 8.5.5, over the protected payload when both apply
+  if (request.tamper_signature && mcdata_authenticates()) data.back() = static_cast<char>(data.back() ^ 1);
+  parts.push_back({mcdata::payload_mime, data});
+  const auto id = mcdata::uuid_text(signalling.message);
+  bounded_push(mcdata_sent_, {{"message_id", id},
+                              {"conversation_id", mcdata::uuid_text(signalling.conversation)},
+                              {"request_type", info.request_type},
+                              {"target", request.target},
+                              {"text", request.content == mcdata::ContentType::Text ? request.text : std::string{}},
+                              {"date_time", signalling.date_time},
+                              {"status", nullptr},
+                              {"called_alias", request.called_alias},
+                              {"dppk_id", dppk ? Json(*dppk) : Json(nullptr)}});
+  SdsRequest retry = request;
+  retry.conversation = signalling.conversation;
+  mcdata_request(
+      "", parts, mcdata_sds_headers(),
+      [this, id, retry](const SipResponse &response) { mcdata_sds_response(id, retry, response); }, "MESSAGE");
+  event("mcdata_sds_sent", {{"message_id", id},
+                            {"request_type", info.request_type},
+                            {"target", request.target},
+                            {"disposition", static_cast<int>(request.disposition)},
+                            {"to_alias", request.to_alias}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 6.6.3.2 and clause 9.2.2.2.1 step 2c: protect the DATA PAYLOAD of a one-to-one SDS with a PCK
+// (sent with it as a MIKEY part) or of a group SDS with the GMK; the key's identifier, empty when unprotected.
+std::optional<std::uint32_t> Client::mcdata_protect_sds(const SdsRequest &request, std::vector<BodyPart> &parts,
+                                                        std::string &data) {
+  std::optional<std::uint32_t> dppk;
+  if (mcdata_protected() && request.type == "one-to-one-sds" && !request.to_alias) {
+    if (request.tamper_key)
+      std::erase_if(mcdata_pcks_, [&request](const auto &entry) { return entry.second.peer == request.target; });
+    auto [key, message] = mcdata_pck_for(request.target);
+    if (request.tamper_key && !message.empty()) {
+      auto &character = message[message.size() / 2];
+      character = character == 'A' ? 'B' : 'A';
+      mcdata_pcks_.erase(key.csb_id); // the recipient will not share this PCK
+    }
+    if (!message.empty()) parts.push_back({"application/mikey", message}); // TS 24.282 clause 9.2.2.2.1 step 2c viii
+    data = mcdata_seal(data, key);
+    dppk = key.csb_id;
+  } else if (mcdata_protected() && request.type == "group-sds") {
+    const auto key = mcdata_gmk_for(request.target);
+    data = mcdata_seal(data, key);
+    dppk = key.csb_id;
+  }
+  return dppk;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 9.2.2.2.1: the response to a standalone SDS: its status, used priority and ad hoc group, and for
+// a functional alias target (300) the SDS again to the MCData ID selected for the alias.
+void Client::mcdata_sds_response(const std::string &id, const SdsRequest &retry, const SipResponse &response) {
+  mcdata_last_result_ = {{"message_id", id},
+                         {"status", response.status_code},
+                         {"warning", std::string(get_header(response.headers, "Warning"))}};
+  // A 2xx may carry mcdata-info: the used priority, and for an ad hoc group SDS
+  // the ad hoc group identity (project extension, see the server).
+  std::string adhoc_group;
+  std::optional<mcdata::Info> answer;
+  if (response.content_type.starts_with(mcdata::info_mime) && !response.body.empty())
+    answer = mcdata::parse_info(response.body);
+  if (response.status_code < 300 && answer) {
+    adhoc_group = answer->calling_group;
+    mcdata_last_result_["group"] = answer->calling_group;
+    mcdata_last_result_["used_priority"] = answer->used_priority ? Json(*answer->used_priority) : Json(nullptr);
+  }
+  for (auto &sent : mcdata_sent_)
+    if (sent.at("message_id") == id) {
+      sent["status"] = response.status_code;
+      if (!adhoc_group.empty()) sent["group"] = adhoc_group;
+    }
+  if (response.status_code == 300 && retry.to_alias && answer && !answer->request_uri.empty()) {
+    // TS 24.282 clause 9.2.2.2.1: send again to the MCData ID selected for the alias, naming the alias.
+    mcdata_last_result_["selected"] = answer->request_uri;
+    SdsRequest next = retry;
+    next.target = answer->request_uri;
+    next.to_alias = false;
+    next.called_alias = retry.target;
+    schedule([this, next] {
+      try {
+        mcdata_send_sds(next);
+      } catch (const std::exception &error) {
+        failure(error.what());
+      }
+    });
+    return;
+  }
+  if (response.status_code >= 300) failure("SDS: " + std::to_string(response.status_code));
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 23.2.1.1 (group regroup), 23.3.1.1 (user regroup) and 23.2.1.2 (removal):
+//   mcdata-regroup create <temporary group identity> <preconfigured group> groups=<id>,... | users=<id>,...
+//   mcdata-regroup remove <temporary group identity>
+// a SIP MESSAGE to the participating MCData function with the mcdata-info (<mcdata-client-id>, the functional alias in
+// use) and the mcdata-regroup body (annex D.6).
+void Client::mcdata_regroup_command(std::istringstream &words) {
+  if (!mcdata_authorized_) throw std::runtime_error("an MCData regroup requires MCData service authorisation");
+  std::string action, tgi, preconfigured, list;
+  words >> action >> tgi;
+  if ((action != "create" && action != "remove") || tgi.empty())
+    throw std::runtime_error("usage: mcdata-regroup create <tgi> <preconfigured group> groups=<id>,...|users=<id>,... "
+                             "| mcdata-regroup remove <tgi>");
+  Regroup regroup;
+  regroup.action = action;
+  regroup.regroup_uri = tgi;
+  if (action == "create") {
+    words >> preconfigured >> list;
+    if (preconfigured.empty() || (!list.starts_with("groups=") && !list.starts_with("users=")))
+      throw std::runtime_error("usage: mcdata-regroup create <tgi> <preconfigured group> groups=<id>,...|users=<id>,...");
+    regroup.preconfigured_group = preconfigured;
+    std::istringstream ids(list.substr(list.find('=') + 1));
+    for (std::string id; std::getline(ids, id, ',');)
+      if (!id.empty()) (list.starts_with("groups=") ? regroup.groups : regroup.users).push_back(id);
+  }
+  mcdata::Info info;
+  info.client_id = client_id(); // TS 24.282 clause 23.2.1.1 step 6
+  if (!mcdata_alias_in_use_.empty() && mcdata_aliases_active_.contains(mcdata_alias_in_use_))
+    info.functional_alias = mcdata_alias_in_use_;
+  const std::string icsi = mcdata::icsi;
+  // TS 24.282 clause 23.2.1.1 steps 1, 2 and 5 (the ICSI in P-Preferred-Service, RFC 6050)
+  const std::vector<SipHeader> headers{{"Accept-Contact", "*;+g.3gpp.mcdata;require;explicit"},
+                                       {"Accept-Contact", "*;+g.3gpp.icsi-ref=\"" + url_encode(icsi) + "\";require;explicit"},
+                                       {"P-Preferred-Service", icsi}};
+  mcdata_regroup_result_ = {{"action", action}, {"regroup", tgi}, {"status", 0}};
+  mcdata_request(
+      "",
+      {{mcdata::info_mime, mcdata::info_xml(info)},
+       {regroup_mime_of(mcx::mcdata_service), regroup_xml(regroup, mcx::mcdata_service)}},
+      headers,
+      [this, action, tgi](const SipResponse &response) {
+        mcdata_regroup_result_ = {{"action", action},
+                                  {"regroup", tgi},
+                                  {"status", response.status_code},
+                                  {"warning", std::string(get_header(response.headers, "Warning"))}};
+        event("mcdata_regroup_result", mcdata_regroup_result_);
+      },
+      "MESSAGE");
+  event("mcdata_regroup_requested", {{"action", action}, {"regroup", tgi}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 23.2.1.3 and 23.2.1.4 (classified by clause 6.2.1.1): a request to the client for the creation or
+// removal of a regroup: 200 (OK); the temporary group identity stored with its preconfigured group, its groups or
+// users (3)); the client affiliated with the regroup (4)) and then targeting it (5)); on removal, de-affiliated.
+std::optional<SipResponse> Client::mcdata_regroup_received(const std::vector<BodyPart> &parts) {
+  const auto mime = regroup_mime_of(mcx::mcdata_service);
+  const auto found = std::find_if(parts.begin(), parts.end(), [&](const BodyPart &part) { return part.content_type == mime; });
+  if (found == parts.end()) return std::nullopt;
+  SipResponse response;
+  response.status_code = 200;
+  Regroup regroup;
+  try {
+    regroup = parse_regroup(found->body, mcx::mcdata_service);
+  } catch (const std::exception &error) {
+    event("mcdata_regroup_unreadable", {{"reason", error.what()}});
+    response.status_code = 400;
+    return response;
+  }
+  if (regroup.action == "create") {
+    mcdata_regroups_[regroup.regroup_uri] = {{"preconfigured", regroup.preconfigured_group},
+                                             {"groups", regroup.groups},
+                                             {"users", regroup.users},
+                                             {"kind", regroup.users.empty() ? "group" : "user"}};
+  } else {
+    mcdata_regroups_.erase(regroup.regroup_uri);
+  }
+  event("mcdata_regroup_notification", {{"regroup", regroup.regroup_uri}, {"action", regroup.action}});
+  // TS 33.180 clause 5.7: the GMK of the preconfigured group, before a communication on the regroup.
+  schedule([this] { update_key_subscriptions(); });
+  return response;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 22.4.2.1.2 and 22.4.2.1.3: bind (unbind) a functional alias to (from) MCData groups: without
+// <allow-functional-alias-binding-with-group> in the user profile, or (binding) for an alias not activated, the user is
+// told and nothing is sent; otherwise a SIP MESSAGE with the MCData-Info (<request-type> "fa-group-binding-req",
+// <binding-ind>, <binding-fa-uri> / <unbinding-fa-uri>, <mcdata-client-id>) and the groups in a resource-lists body.
+void Client::mcdata_fa_binding(bool bind, const std::string &alias, const std::vector<std::string> &groups) {
+  if (!mcdata_authorized_) throw std::runtime_error("functional alias binding requires MCData service authorisation");
+  require_mcdata_profile({"allow-functional-alias-binding-with-group"});
+  if (bind && !mcdata_aliases_active_.contains(alias))
+    throw std::runtime_error("functional alias " + alias + " is not activated (TS 24.282 clause 22.4.2.1.2)");
+  mcdata::Info info;
+  info.request_type = "fa-group-binding-req";
+  info.binding = bind;
+  (bind ? info.binding_fa_uri : info.unbinding_fa_uri) = alias;
+  info.client_id = client_id();
+  if (!mcdata_alias_in_use_.empty() && mcdata_aliases_active_.contains(mcdata_alias_in_use_))
+    info.functional_alias = mcdata_alias_in_use_;
+  const std::string icsi = mcdata::icsi; // P-Preferred-Service: mcdata_request
+  const std::vector<SipHeader> headers{{"Accept-Contact", "*;+g.3gpp.mcdata;require;explicit"},
+                                       {"Accept-Contact", "*;+g.3gpp.icsi-ref=\"" + url_encode(icsi) + "\";require;explicit"}};
+  mcdata_fa_binding_result_ = {{"bind", bind}, {"alias", alias}, {"groups", groups}, {"status", 0}};
+  mcdata_request(
+      "", {{mcdata::info_mime, mcdata::info_xml(info)}, {resource_lists_mime, resource_list_xml(groups)}}, headers,
+      [this, bind, alias](const SipResponse &response) {
+        mcdata_fa_binding_result_["status"] = response.status_code;
+        mcdata_fa_binding_result_["warning"] = std::string(get_header(response.headers, "Warning"));
+        event("mcdata_fa_binding_result", {{"bind", bind}, {"alias", alias}, {"status", response.status_code}});
+      },
+      "MESSAGE");
+  event("mcdata_fa_binding_requested", {{"bind", bind}, {"alias", alias}, {"groups", groups}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 6.2.7.5: cancel the in-progress emergency state of a group (and the user's own emergency alert) when
+// no communication is ongoing on it: a SIP MESSAGE to the participating function with <mcdata-request-uri> the group,
+// <emergency-ind> false and, cancelling the alert, <alert-ind> false (MDEA 4). The result comes in the SS's MESSAGE
+// with <emergency-ind-rcvd> true (mcdata_emergency_cancel_received). The clause does not have the request carry
+// <mcdata-client-id> but matches the reply by it: it is included.
+void Client::mcdata_emergency_cancel_command(std::istringstream &words) {
+  if (!mcdata_authorized_) throw std::runtime_error("cancelling an emergency requires MCData service authorisation");
+  std::string group, word;
+  words >> group;
+  bool alert = false;
+  while (words >> word) alert = alert || word == "alert";
+  if (group.empty()) throw std::runtime_error("usage: mcdata-emergency-cancel <group> [alert]");
+  if (mcdata_media_ && mcdata_session_group_ == group)
+    throw std::runtime_error("a communication is ongoing on the group: cancel it in the session (6.2.7.2)");
+  if (mdeg_ != 2) throw std::runtime_error("the group is not in an emergency state");
+  if (alert) require_mcdata_profile({"allow-cancel-emergency-alert"}); // TS 24.282 clause 6.2.8.1.6
+  mcdata::Info info;
+  info.request_uri = group;
+  info.emergency = false;
+  info.client_id = client_id();
+  if (alert) {
+    info.alert = false;
+    mdea_ = 4; // TS 24.282 clause 6.2.7.5 8)
+  }
+  mcdata_emergency_cancel_ = {{"group", group}, {"alert", alert}, {"client_id", info.client_id}, {"status", 0}};
+  const std::string icsi = mcdata::icsi;
+  mcdata_request(
+      "", {{mcdata::info_mime, mcdata::info_xml(info)}},
+      {{"Accept-Contact", "*;+g.3gpp.icsi-ref=\"" + url_encode(icsi) + "\";require;explicit"}},
+      [this, alert](const SipResponse &response) {
+        mcdata_emergency_cancel_["status"] = response.status_code;
+        if (response.status_code >= 300) {
+          // TS 24.282 clause 6.2.7.5 (4xx, 5xx, 6xx): <alert-ind> true in the response: the alert stays.
+          for (const auto &part : response.parts)
+            if (part.content_type == mcdata::info_mime && mcdata::parse_info(part.body).alert == true && mdea_ == 4)
+              mdea_ = 3;
+          if (alert && mdea_ == 4) mdea_ = 3;
+          failure("emergency cancel: " + std::to_string(response.status_code));
+        }
+        event("mcdata_emergency_cancel_answered", {{"status", response.status_code}});
+      },
+      "MESSAGE");
+  event("mcdata_emergency_cancel_sent", {{"group", group}, {"alert", alert}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 6.2.7.5: the controlling function's SIP MESSAGE with <emergency-ind-rcvd> true and the
+// <mcdata-client-id> of this client's cancel: <emergency-ind> false: MDEG 1; <alert-ind> true (MDEA 4, the alert was to
+// be cancelled): MDEA 3; false: MDEA 1 and the MCData emergency state cleared. 200 (OK).
+SipResponse Client::mcdata_emergency_cancel_received(const mcdata::Info &info) {
+  SipResponse response;
+  response.status_code = 200;
+  if (!mcdata_emergency_cancel_.is_object() || info.client_id != mcdata_emergency_cancel_.value("client_id", "")) {
+    event("mcdata_emergency_receipt_ignored", {{"client_id", info.client_id}});
+    return response;
+  }
+  if (info.emergency == false) {
+    mdeg_ = 1;
+    mdegc_ = 1;
+  }
+  if (mdea_ == 4 && info.alert == true) mdea_ = 3;
+  if (mdea_ == 4 && info.alert == false) {
+    mdea_ = 1;
+    mcdata_emergency_ = false;
+  }
+  mcdata_emergency_cancel_["receipt"] = true;
+  event("mcdata_emergency_cancel_confirmed",
+        {{"group", mcdata_emergency_cancel_.value("group", "")}, {"state", mdeg_name(mdeg_)}});
+  return response;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 25.2: subscribe to the conference event package of the open group session: a SUBSCRIBE in a new
+// dialog (1), 9)) to the MCData session identity (2)), P-Preferred-Service and Accept-Contact with the MCData ICSI
+// (3)-4)), Expires 4294967295 (current state and changes, 5)) or 0 (fetch, 6)), Accept application/conference-info+xml
+// (7)), an MCData-Info with <mcdata-request-uri> the group (8)).
+void Client::mcdata_conference_subscribe(bool fetch) {
+  const auto group = !mcdata_session_group_.empty() ? mcdata_session_group_ : mcdata_media_group_;
+  if (!mcdata_media_ || !mcdata_media_session_ || group.empty() || mcdata_session_uri_.empty())
+    throw std::runtime_error("no group SDS session is open");
+  if (!fetch && !mcdata_conference_dialog_.empty()) throw std::runtime_error("already subscribed");
+  const std::string icsi = mcdata::icsi;
+  std::vector<SipHeader> headers{{"P-Preferred-Service", icsi},
+                                 {"Accept-Contact", "*;+g.3gpp.icsi-ref=\"" + url_encode(icsi) + "\";require;explicit"},
+                                 {"Accept", "application/conference-info+xml"}};
+  mcdata::Info info;
+  info.request_uri = group;
+  const auto parts = mcdata_seal_signalling({{mcdata::info_mime, mcdata::info_xml(info)}});
+  mcdata_conference_ = {{"group", group}, {"status", 0}, {"participants", Json::array()}, {"fetch", fetch}};
+  const auto dialog = sip_.subscribe(
+      mcdata_session_uri_, "conference", fetch ? 0u : 4294967295u, headers,
+      [this](const SipResponse &response) {
+        if (!mcdata_conference_.is_object()) return;
+        mcdata_conference_["status"] = response.status_code;
+        if (response.status_code >= 300) mcdata_conference_dialog_.clear();
+        event("mcdata_conference_subscribed", {{"status", response.status_code}});
+      },
+      parts.front().content_type, parts.front().body);
+  mcdata_conference_dialog_ = dialog;
+  event("mcdata_conference_subscribing", {{"group", group}, {"fetch", fetch}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 25.2 ("shall terminate the subscription"), RFC 6665 section 4.1.2.3: a SUBSCRIBE in its dialog
+// with Expires 0.
+void Client::mcdata_conference_unsubscribe() {
+  if (mcdata_conference_dialog_.empty()) throw std::runtime_error("no conference event subscription");
+  const std::string icsi = mcdata::icsi;
+  sip_.request_in_dialog(mcdata_conference_dialog_, "SUBSCRIBE", "", "",
+                         {{"Event", "conference"},
+                          {"Expires", "0"},
+                          {"Accept", "application/conference-info+xml"},
+                          {"P-Preferred-Service", icsi}},
+                         [this](const SipResponse &response) {
+                           event("mcdata_conference_unsubscribed", {{"status", response.status_code}});
+                         });
+  event("mcdata_conference_unsubscribing");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 25.2 with RFC 6665 and RFC 4575: a NOTIFY of the subscription: 200 (OK); the participants of a
+// conference-info document kept (and shown); "terminated" ends the subscription.
+SipResponse Client::mcdata_conference_notify(const SipMessage &message) {
+  SipResponse response;
+  response.status_code = 200;
+  if (!mcdata_conference_.is_object()) mcdata_conference_ = {{"participants", Json::array()}};
+  for (const auto &part :
+       message.parts.empty() ? std::vector<BodyPart>{{message.content_type, message.body}} : message.parts) {
+    if (part.content_type != "application/conference-info+xml") continue;
+    try {
+      const auto info = parse_conference_info(part.body);
+      Json users = Json::array();
+      for (const auto &user : info.users) users.push_back({{"id", user.user_id}, {"status", user.status}});
+      mcdata_conference_["participants"] = users;
+      mcdata_conference_["version"] = info.version;
+      event("mcdata_conference_notified", {{"version", info.version}, {"participants", users}});
+    } catch (const std::exception &error) {
+      event("mcdata_conference_unreadable", {{"reason", error.what()}});
+    }
+  }
+  if (get_header(message.headers, "Subscription-State").starts_with("terminated")) {
+    mcdata_conference_dialog_.clear();
+    mcdata_conference_["terminated"] = true;
+  }
+  return response;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 24.2.7.2: ad hoc group determination: a SIP MESSAGE (6.2.4.1) with <request-type>
+// "ad-hoc-group-determination", the users in a resource-lists body or the criteria in <comn-participants-criteria>; on
+// a 2xx the <mcdata-calling-group-id>, the <preconfigured-group> and the criteria of the response are stored.
+// mcdata-adhoc-determine <ID,ID,...|criteria=<criteria>>
+void Client::mcdata_adhoc_determine_command(std::istringstream &words) {
+  if (!mcdata_authorized_) throw std::runtime_error("ad hoc group determination requires MCData service authorisation");
+  std::string spec;
+  words >> spec;
+  if (spec.empty()) throw std::runtime_error("usage: mcdata-adhoc-determine <ID,ID,...|criteria=<criteria>>");
+  mcdata::Info info;
+  info.request_type = "ad-hoc-group-determination";
+  info.client_id = client_id();
+  const auto participants = mcdata_adhoc_target(spec, info);
+  if (!mcdata_alias_in_use_.empty() && mcdata_aliases_active_.contains(mcdata_alias_in_use_))
+    info.functional_alias = mcdata_alias_in_use_;
+  std::vector<BodyPart> parts{{mcdata::info_mime, mcdata::info_xml(info)}};
+  if (!participants.empty()) parts.push_back({resource_lists_mime, resource_list_xml(participants)});
+  const std::string icsi = mcdata::icsi;
+  mcdata_adhoc_determined_ = {{"status", 0}};
+  mcdata_request(
+      "", parts, {{"Accept-Contact", "*;+g.3gpp.icsi-ref=\"" + url_encode(icsi) + "\";require;explicit"}},
+      [this](const SipResponse &response) {
+        mcdata_adhoc_determined_["status"] = response.status_code;
+        if (response.status_code >= 300) {
+          failure("ad hoc group determination: " + std::to_string(response.status_code));
+          return;
+        }
+        for (const auto &part : response.parts)
+          if (part.content_type == mcdata::info_mime) {
+            const auto answer = mcdata::parse_info(part.body);
+            mcdata_adhoc_determined_["group"] = answer.calling_group;
+            mcdata_adhoc_determined_["preconfigured_group"] = answer.preconfigured_group;
+            mcdata_adhoc_determined_["criteria"] = answer.participant_criteria;
+          }
+        event("mcdata_adhoc_group_determined", mcdata_adhoc_determined_);
+      },
+      "MESSAGE");
+  event("mcdata_adhoc_determination_sent", {{"spec", spec}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 24.2.5.1.1: rejoin the ad hoc group session the user left: the INVITE of 24.2.2.1.1 with the
+// Request-URI the MCData session identity of the session.
+void Client::mcdata_adhoc_rejoin() {
+  if (!mcdata_adhoc_last_.is_object() || mcdata_adhoc_last_.value("uri", "").empty())
+    throw std::runtime_error("no ad hoc group session to rejoin");
+  mcdata_rejoin_uri_ = mcdata_adhoc_last_.value("uri", "");
+  try {
+    mcdata_open_session(mcdata_adhoc_last_.value("target", ""), true, "normal", false);
+  } catch (...) {
+    mcdata_rejoin_uri_.clear();
+    throw;
+  }
+  mcdata_rejoin_uri_.clear();
+  event("mcdata_adhoc_rejoining", {{"uri", mcdata_adhoc_last_.value("uri", "")}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 24.2.6.1.1: modify the participants of the open ad hoc group session: a re-INVITE with the MCData-Info
+// as established, a resource-lists body of the users to add (method=INVITE) and remove (method=BYE), or (a session set
+// up with criteria only) the new <comn-participants-criteria>, never both (NOTE); an SDP offer of the current media.
+// sds-session modify [add=<ID,...>] [remove=<ID,...>] | criteria=<criteria>
+void Client::mcdata_adhoc_modify(std::istringstream &words) {
+  if (!mcdata_media_ || !mcdata_media_session_ || !mcdata_session_adhoc_ || mcdata_media_dialog_.empty())
+    throw std::runtime_error("no ad hoc group SDS session is open");
+  std::vector<std::string> entries;
+  std::string criteria;
+  const auto split = [](const std::string &value, const char *method, std::vector<std::string> &out) {
+    std::istringstream list(value);
+    for (std::string id; std::getline(list, id, ',');)
+      if (!id.empty()) out.push_back(id + ";method=" + method);
+  };
+  for (std::string word; words >> word;) {
+    if (word.starts_with("add=")) split(word.substr(4), "INVITE", entries);
+    else if (word.starts_with("remove=")) split(word.substr(7), "BYE", entries);
+    else if (word.starts_with("criteria=")) criteria = word.substr(9);
+    else throw std::runtime_error("usage: sds-session modify [add=<ID,...>] [remove=<ID,...>] | criteria=<criteria>");
+  }
+  if (!entries.empty() && !criteria.empty())
+    throw std::runtime_error("the participants and the criteria are not modified together (TS 24.282 24.2.6.1.1 NOTE)");
+  if (entries.empty() && criteria.empty()) throw std::runtime_error("nothing to modify");
+  if (!criteria.empty() && mcdata_adhoc_last_.value("criteria", "").empty())
+    throw std::runtime_error("the session was not set up with criteria (TS 24.282 24.2.6.1.1 2a))");
+  mcdata::Info info;
+  info.request_type = "adhoc-group-sds-session";
+  info.client_id = client_id();
+  if (!criteria.empty()) {
+    info.participant_criteria = criteria;
+    mcdata_adhoc_last_["criteria"] = criteria;
+  }
+  std::vector<BodyPart> parts{{mcdata::info_mime, mcdata::info_xml(info)}};
+  if (!entries.empty()) parts.push_back({resource_lists_mime, resource_list_xml(entries)});
+  auto headers = mcdata_media_headers();
+  sip_.reinvite_sdp(
+      mcdata_media_dialog_, mcdata_media_current_sdp(), mcdata_seal_signalling(parts),
+      [this](const SipResponse &raw) {
+        const auto response = mcdata_opened_response(raw);
+        if (response.status_code < 200) return;
+        mcdata_media_result_["modify_status"] = response.status_code;
+        mcdata_media_result_["modify_warning"] = std::string(get_header(response.headers, "Warning"));
+        event("mcdata_adhoc_modified", {{"status", response.status_code}});
+      },
+      headers);
+  event("mcdata_adhoc_modify_requested", {{"entries", entries}, {"criteria", criteria}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 16.2A.1.1 (on), 16.2A.1.2 (off) and 16.2A.1.4 (modify): the ad hoc group emergency alert: a SIP
+// MESSAGE with P-Preferred-Service / Accept-Contact of the MCData ICSI, the MCData-Info (<adhoc-alert-ind>,
+// <mcdata-client-id>, <comn-participants-criteria>, the ad hoc group in <mcdata-request-uri> when known) and, raising
+// or modifying it, the location information (6.2.5.1); the authorisations of 6.2.8.1.19.
+// mcdata-adhoc-alert on criteria=<c> [text...] | off [originated-by=<ID>] | modify criteria=<c> [text...]
+void Client::mcdata_adhoc_alert_command(std::istringstream &words) {
+  if (!mcdata_authorized_) throw std::runtime_error("an ad hoc group emergency alert requires MCData service authorisation");
+  std::string action, criteria, originator, text;
+  words >> action;
+  for (std::string word; words >> word;) {
+    if (word.starts_with("criteria=")) criteria = word.substr(9);
+    else if (word.starts_with("originated-by=")) originator = word.substr(14);
+    else text += (text.empty() ? "" : " ") + word;
+  }
+  if (action != "on" && action != "off" && action != "modify")
+    throw std::runtime_error("usage: mcdata-adhoc-alert on criteria=<c> [text] | off [originated-by=<ID>] | modify criteria=<c>");
+  const auto group = mcdata_adhoc_alert_.is_object() ? mcdata_adhoc_alert_.value("group", "") : std::string{};
+  mcdata::Info info;
+  info.client_id = client_id();
+  if (!mcdata_alias_in_use_.empty() && mcdata_aliases_active_.contains(mcdata_alias_in_use_))
+    info.functional_alias = mcdata_alias_in_use_;
+  std::vector<BodyPart> parts;
+  if (action == "on") {
+    require_mcdata_profile({"allow-activate-adhoc-group-emergency-alert"}); // TS 24.282 clause 6.2.8.1.19
+    if (criteria.empty()) throw std::runtime_error("an ad hoc group emergency alert needs criteria (16.2A.1.1 4)g))");
+    info.request_uri = group;
+    info.adhoc_alert = true;
+    info.participant_criteria = criteria;
+    info.adhoc_additional_information = text;
+    mcdata_emergency_ = true;
+    mcdata_ah_mea_ = 2;
+    mcdata_adhoc_alert_ = {{"group", group}, {"criteria", criteria}, {"client_id", info.client_id}, {"state", 2}};
+  } else if (action == "off") {
+    require_mcdata_profile({"allow-cancel-adhoc-group-emergency-alert"}); // TS 24.282 clause 6.2.8.1.19
+    if (group.empty()) throw std::runtime_error("no ad hoc group emergency alert known");
+    if (originator.empty() && mcdata_ah_mea_ != 3) throw std::runtime_error("no ad hoc group emergency alert of this user");
+    info.request_uri = group;
+    info.adhoc_alert = false;
+    info.originated_by = originator;
+    if (originator.empty()) mcdata_ah_mea_ = 4; // TS 24.282 clause 16.2A.1.2 6)
+    mcdata_adhoc_alert_["originated_by"] = originator;
+  } else {
+    if (group.empty()) throw std::runtime_error("no ad hoc group emergency alert known");
+    if (criteria.empty()) throw std::runtime_error("the new criteria are needed (16.2A.1.4 c)v))");
+    info.request_uri = group;
+    info.adhoc_alert = true;
+    info.request_type = "ad-hoc-emergency-alert-participant-criteria-modification";
+    info.participant_criteria = criteria;
+    info.adhoc_additional_information = text;
+    mcdata_emergency_ = true;
+  }
+  parts.push_back({mcdata::info_mime, mcdata::info_xml(info)});
+  if (action != "off")
+    parts.push_back({mcdata::location_mime, emergency_location_xml(mcdata_emergency_location(), true)});
+  const std::string icsi = mcdata::icsi;
+  mcdata_request(
+      "", parts, {{"Accept-Contact", "*;+g.3gpp.icsi-ref=\"" + url_encode(icsi) + "\";require;explicit"}},
+      [this, action](const SipResponse &response) {
+        mcdata_adhoc_alert_["status"] = response.status_code;
+        if (action == "on") mcdata_ah_mea_ = response.status_code < 300 ? (mcdata_ah_mea_ == 2 ? 3 : mcdata_ah_mea_) : 1; // 16.2A.1.1
+        if (action == "off" && response.status_code >= 300 && mcdata_ah_mea_ == 4) {
+          // TS 24.282 clause 16.2A.1.2 (4xx): <adhoc-alert-ind> true, or none: the alert stays
+          bool stays = true;
+          for (const auto &part : response.parts)
+            if (part.content_type == mcdata::info_mime && mcdata::parse_info(part.body).adhoc_alert == false)
+              stays = false;
+          if (stays) mcdata_ah_mea_ = 3;
+        }
+        mcdata_adhoc_alert_["state"] = mcdata_ah_mea_;
+        if (response.status_code >= 300) failure("ad hoc alert " + action + ": " + std::to_string(response.status_code));
+      },
+      "MESSAGE");
+  event("mcdata_adhoc_alert_sent", {{"action", action}, {"group", group}, {"criteria", criteria}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 16.2A.1.1-16.2A.1.3 and 16.2A.1.5: an incoming SIP MESSAGE about an ad hoc group emergency alert
+// (dispatched on <adhoc-alert-ind> before <alert-ind>: the controlling function also sets <alert-ind>, 6.3.7.1.3):
+// the receipt of this client's request (<adhoc-alert-ind-rcvd> true and its <mcdata-client-id>: the ad hoc group
+// identity stored, AH-MEA settled), the response to a criteria modification (16.2A.1.5) or another user's alert or its
+// cancellation (16.2A.1.3: <originated-by> this user: AH-MEA 1). 200 (OK).
+SipResponse Client::mcdata_adhoc_alert_received(const mcdata::Info &info) {
+  SipResponse response;
+  response.status_code = 200;
+  if (!mcdata_adhoc_alert_.is_object()) mcdata_adhoc_alert_ = Json::object();
+  const bool own = info.client_id == client_id() && info.adhoc_alert_received == true;
+  if (own || !info.response_type.empty()) {
+    if (!info.calling_group.empty()) mcdata_adhoc_alert_["group"] = info.calling_group;
+    if (!info.participant_criteria.empty()) mcdata_adhoc_alert_["criteria"] = info.participant_criteria;
+    const bool by_other = !mcdata_adhoc_alert_.value("originated_by", "").empty();
+    if (info.adhoc_alert == false && mcdata_ah_mea_ == 4 && !by_other) {
+      mcdata_ah_mea_ = 1;
+      mcdata_emergency_ = false;
+    } else if (info.adhoc_alert == true && mcdata_ah_mea_ == 4 && !by_other) {
+      mcdata_ah_mea_ = 3;
+    }
+    mcdata_adhoc_alert_["state"] = mcdata_ah_mea_;
+    event("mcdata_adhoc_alert_receipt", {{"group", info.calling_group}, {"alert", info.adhoc_alert.value_or(false)},
+                                         {"response_type", info.response_type}});
+    return response;
+  }
+  if (info.adhoc_alert == false && info.originated_by == mcdata_user()) mcdata_ah_mea_ = 1; // 16.2A.1.3 2)b)
+  bounded_push(mcdata_adhoc_alerts_, {{"group", info.calling_group},
+                                       {"from", info.originated_by.empty() ? info.calling_user : info.originated_by},
+                                       {"alert", info.adhoc_alert.value_or(false)},
+                                       {"text", info.adhoc_additional_information},
+                                       {"organization", info.organization}});
+  event("mcdata_adhoc_alert_received",
+        {{"group", info.calling_group}, {"from", info.calling_user}, {"alert", info.adhoc_alert.value_or(false)}});
+  return response;
+}
+
+} // namespace mcx

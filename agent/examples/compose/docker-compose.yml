@@ -1,0 +1,103 @@
+#
+# OpenMCX Licence Information : AGPL-3.0-or-later
+#
+
+# Agents next to an MC system: mcx-agent (the plumbing, with mcx-client as its engine) and three third-party agents,
+# each in a container of its own that reaches it over MCP on HTTP: the chat bot (MCData), the voice bot (MCPTT) and
+# the video bot (MCVideo). With the profile "ui", also the OpenMCX client page (the dispatcher service at /client/)
+# as a user who chats, talks and watches.
+# See README.md in this directory.
+#
+#   openssl rand -hex 32 > secrets/mcx-agent-token
+#   docker compose up -d                  # mcx-agent and the three bots
+#   docker compose --profile ui up -d     # and the client page on http://127.0.0.1:8080/client/
+
+services:
+  mcx-agent:
+    image: ${OPENMCX_AGENT_IMAGE:-openmcx-agent:0.1}
+    init: true
+    command: ["daemon", "--config", "/etc/mcx-agent/agent.json"]
+    environment:
+      MCX_AGENT_SOCKET: /run/mcx-agent/agent.sock
+    volumes:
+      - ./agent/agent.json:/etc/mcx-agent/agent.json:ro
+      - ./agent/client:/config:ro              # the engine's mcx-client configuration and its TLS files
+      - agent-data:/var/lib/mcx-agent          # the message store, the audit log, the outbox
+    tmpfs:
+      - /run/mcx                               # the engine's control FIFO and status file
+      - /run/mcx-agent                         # the daemon's socket (the CLI: docker compose exec mcx-agent mcx-agent status)
+    secrets:
+      - mcx_agent_token
+    networks: [mc, agents]
+    restart: unless-stopped
+
+  # The third-party agents: nothing of OpenMCX inside, only the MCP endpoint and the token, and the agents network
+  # only: no route to the MC system. All three share the agent's MC identity, each on its own service.
+  chat-bot:                                    # MCData: answers time, ping and help
+    image: python:3.12-alpine
+    command: ["python", "-u", "/bots/chat-bot.py", "--url", "http://mcx-agent:8765/mcp",
+              "--token-file", "/run/secrets/mcx_agent_token", "--cursor", "/state/chat.cursor"]
+    volumes:
+      - ../chat-bot.py:/bots/chat-bot.py:ro
+      - bot-state:/state
+    secrets:
+      - mcx_agent_token
+    networks: [agents]
+    depends_on: [mcx-agent]
+    restart: unless-stopped
+
+  voice-bot:                                   # MCPTT: plays each talk burst back, in private and group calls
+    image: python:3.12-alpine
+    command: ["python", "-u", "/bots/voice-bot.py", "--mcp-url", "http://mcx-agent:8765/mcp",
+              "--token-file", "/run/secrets/mcx_agent_token"]
+    volumes:
+      - ../voice-bot.py:/bots/voice-bot.py:ro
+      - ../mcxagent.py:/bots/mcxagent.py:ro
+    secrets:
+      - mcx_agent_token
+    networks: [agents]
+    depends_on: [mcx-agent]
+    restart: unless-stopped
+
+  video-bot:                                   # MCVideo: shows a test card in every video call it is in
+    image: python:3.12-alpine
+    command: ["python", "-u", "/bots/video-bot.py", "--mcp-url", "http://mcx-agent:8765/mcp",
+              "--token-file", "/run/secrets/mcx_agent_token"]
+    volumes:
+      - ../video-bot.py:/bots/video-bot.py:ro
+      - ../mcxagent.py:/bots/mcxagent.py:ro
+    secrets:
+      - mcx_agent_token
+    networks: [agents]
+    depends_on: [mcx-agent]
+    restart: unless-stopped
+
+  # A user of the MC system in the browser, who chats, talks and watches (another MC identity).
+  client:
+    profiles: [ui]
+    image: ${OPENMCX_DISPATCHER_IMAGE:-openmcx-dispatcher:0.1}
+    init: true
+    command: ["--listen", "0.0.0.0:8080", "--config", "/config/client.json", "--outbox", "/run/mcx/outbox",
+              "--ops-agent", "${OPS_AGENT:-sip:ops-bot.mcdata@example.org}",
+              "--ops-agent-alias=${OPS_AGENT_IS_ALIAS:-false}"]
+    volumes:
+      - ./ui/client:/config:ro                 # its mcx-client configuration, with media.live
+    tmpfs:
+      - /run/mcx
+    ports:
+      - "127.0.0.1:8080:8080"                  # localhost only: the page has no sign-in in this mode
+    networks: [mc]
+    restart: unless-stopped
+
+networks:
+  mc: {}                                       # reaches the MC system (SIP core, servers, IdMS)
+  agents:
+    internal: true                             # mcx-agent and the agents, no way out
+
+volumes:
+  agent-data: {}
+  bot-state: {}
+
+secrets:
+  mcx_agent_token:
+    file: ./secrets/mcx-agent-token

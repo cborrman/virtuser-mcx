@@ -1,0 +1,253 @@
+//
+// OpenMCX Licence Information : AGPL-3.0-or-later
+//
+
+// MCVideo functional aliases: activation, deactivation, take-over and status subscription (TS 24.281 clause 20.2.1).
+// Member functions of Client (declared in client.hpp).
+//
+// Specifications: TS 24.281 V19.6.0 (Rel-19).
+
+#include "client.hpp"
+
+namespace mcx {
+
+//------------------------------------------------------------------------------
+// TS 24.281 clauses 9.2.1.2.1.1 and 10.2.2.2.1: the functional alias to present in a call, the one chosen while it
+// is active.
+std::string Client::mcvideo_presented_alias() const {
+  return mcvideo_aliases_.contains(mcvideo_alias_in_use_) ? mcvideo_alias_in_use_ : std::string{};
+}
+
+//------------------------------------------------------------------------------
+// TS 24.281 clause 20.2.1.2: the functional alias status change procedure: a PUBLISH to the participating function
+// with the mcvideo-info body naming this user and the per-user PIDF (namespace urn:3gpp:ns:mcvideoPresInfoFA:1.0)
+// listing every alias wanted active (step 6 a): the participating function takes them as the user's whole set (clause
+// 20.2.2.2.3 steps 12 to 14), so the change is applied to the aliases known active, or to the set of a change still
+// awaiting its outcome. Expires 4294967295 (step 4), or 0 when none is wanted (step 5). The answer only says the
+// request was taken: with the subscription to this user's status (clause 20.2.1.1) its NOTIFY gives the outcome;
+// without it, the client counts an accepted request as done. <take-over> is sent only for aliases that
+// NOTIFY offered as "take-over-possible" (step 6 d)); a take-over asked earlier goes as an activation and follows
+// once offered.
+void Client::mcvideo_functional_alias(const std::string &action, const std::vector<std::string> &aliases,
+                                      bool by_location) {
+  if (action == "use") {
+    if (aliases.size() != 1) throw std::runtime_error("mcvideo-fa use <alias>|none");
+    mcvideo_alias_in_use_ = aliases.front() == "none" ? std::string{} : aliases.front();
+    return;
+  }
+  if ((action != "activate" && action != "takeover" && action != "deactivate") || aliases.empty())
+    throw std::runtime_error("mcvideo-fa activate|takeover|deactivate <alias>...");
+  if (!mcvideo_authorized_) throw std::runtime_error("functional alias change requires MCVideo service authorisation");
+  // TS 24.281 clause 20.2.1.2: the user's deactivation of an alias a location criterion activated is suppressed while
+  // <manual-deactivation-not-allowed-if-location-criteria-met> is "true" (the criterion is met until a location
+  // criterion deactivates it).
+  if (action == "deactivate" && !by_location)
+    for (const auto &alias : aliases)
+      if (mcvideo_aliases_by_location_.contains(alias))
+        for (const auto &rule : mcvideo_alias_rules_)
+          if (rule.alias == alias && rule.manual_deactivation_locked) {
+            event("mcvideo_functional_alias_suppressed", {{"alias", alias}});
+            throw std::runtime_error("deactivation of " + alias + " suppressed: its location criteria are met");
+          }
+  for (const auto &alias : aliases)
+    if (by_location && action == "activate")
+      mcvideo_aliases_by_location_.insert(alias);
+    else
+      mcvideo_aliases_by_location_.erase(alias);
+  McpttInfo info;
+  info.request_uri = mcvideo_user();
+  info.client_id = client_id();
+  const bool offered = std::all_of(aliases.begin(), aliases.end(),
+                                   [&](const auto &alias) { return mcvideo_takeover_possible_.contains(alias); });
+  for (const auto &alias : aliases)
+    if (action == "takeover" && !offered)
+      mcvideo_takeover_wanted_.insert(alias);
+    else
+      mcvideo_takeover_wanted_.erase(alias);
+  auto wanted = mcvideo_alias_publish_open_.empty() ? mcvideo_aliases_standing_ : mcvideo_aliases_wanted_;
+  for (const auto &alias : aliases)
+    if (action == "deactivate")
+      wanted.erase(alias);
+    else
+      wanted.insert(alias);
+  FunctionalAliasRequest request{
+      mcvideo_user(), client_id(), random_id(), {wanted.begin(), wanted.end()}, action == "takeover" && offered};
+  request.mcvideo = true;
+  mcvideo_aliases_wanted_ = wanted;
+  mcvideo_alias_publish_open_ = request.publish_id;
+  mcvideo_fa_result_ = {{"action", action},
+                        {"aliases", aliases},
+                        {"status", 0},
+                        {"p_id_fa", request.publish_id},
+                        {"take_over", request.take_over},
+                        {"outcomes", Json::object()}};
+  mcvideo_request("presence",
+                  {{mcvideo_service.info_mime, service_info_xml(info, mcvideo_service)},
+                   {"application/pidf+xml", functional_alias_xml(request)}},
+                  {{"Expires", wanted.empty() ? "0" : "4294967295"}},
+                  [this, wanted, aliases, pid = request.publish_id](const SipResponse &response) {
+                    if (response.status_code < 200) return;
+                    if (mcvideo_fa_result_.value("p_id_fa", "") == pid)
+                      mcvideo_fa_result_["status"] = response.status_code;
+                    if (response.status_code != 200)
+                      for (const auto &alias : aliases) mcvideo_takeover_wanted_.erase(alias);
+                    const bool followed = std::any_of(mcvideo_alias_dialogs_.begin(), mcvideo_alias_dialogs_.end(),
+                                                      [](const auto &dialog) { return dialog.second.empty(); });
+                    if (response.status_code == 200 && !followed) mcvideo_aliases_ = mcvideo_aliases_standing_ = wanted;
+                    if ((response.status_code != 200 || !followed) && mcvideo_alias_publish_open_ == pid)
+                      mcvideo_alias_publish_open_.clear();
+                    event("mcvideo_functional_alias_result", mcvideo_fa_result_);
+                  });
+  event("mcvideo_functional_alias_requested", {{"action", action}, {"aliases", aliases}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.281 clause 20.2.1.4: when a location criterion of the MCVideo user profile for a functional alias's
+// activation or deactivation is met, the client initiates the functional alias status change procedure (clause
+// 20.2.1.2). A criterion is the entry into or the exit from an area (TS 24.484 clause 9.3.2.1 item 10,
+// <EnterSpecificArea>, <ExitSpecificArea>): it is met when the position crosses the area's contour between two
+// positions; the first position after the profile is read only sets where the client is. An alias already in the
+// state the criterion asks for is left as it is.
+void Client::mcvideo_alias_location(const location::Point &position) {
+  if (mcvideo_alias_rules_.empty()) return;
+  const double lat = position.lat(), lon = position.lon();
+  for (const auto &rule : mcvideo_alias_rules_) {
+    const auto crossed = [&](const std::vector<location::Area> &areas, const char *kind, bool entry) {
+      bool met = false;
+      for (std::size_t index = 0; index < areas.size(); ++index) {
+        const auto key = rule.alias + "|" + kind + "|" + std::to_string(index);
+        const bool inside = location::inside(areas[index], lat, lon);
+        const auto previous = mcvideo_alias_area_inside_.find(key);
+        if (previous != mcvideo_alias_area_inside_.end() && previous->second != inside && inside == entry) met = true;
+        mcvideo_alias_area_inside_[key] = inside;
+      }
+      return met;
+    };
+    const bool activate = crossed(rule.activate_on_entry, "activate-enter", true) |
+                          crossed(rule.activate_on_exit, "activate-exit", false);
+    const bool deactivate = crossed(rule.deactivate_on_entry, "deactivate-enter", true) |
+                            crossed(rule.deactivate_on_exit, "deactivate-exit", false);
+    const bool active = mcvideo_aliases_wanted_.contains(rule.alias) || mcvideo_aliases_.contains(rule.alias);
+    const char *action = activate && !deactivate && !active   ? "activate"
+                         : deactivate && !activate && active ? "deactivate"
+                                                             : nullptr;
+    if (!action) continue;
+    event("mcvideo_functional_alias_location", {{"alias", rule.alias}, {"action", action}, {"position", {lat, lon}}});
+    try {
+      mcvideo_functional_alias(action, {rule.alias}, true);
+    } catch (const std::exception &error) {
+      event("mcvideo_functional_alias_location_failed", {{"alias", rule.alias}, {"reason", error.what()}});
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+// TS 24.281 clause 20.2.1.3: the functional alias status determination procedure: a SUBSCRIBE to the presence event
+// package for the aliases active for this user or for the users of one alias.
+void Client::mcvideo_alias_subscribe(const std::string &alias, bool fetch) {
+  if (!mcvideo_authorized_) throw std::runtime_error("functional alias status requires MCVideo service authorisation");
+  // TS 24.281 clause 20.2.1.3 steps 2 and 2A: <mcvideo-request-uri> names this user or the alias, with its <req-type>.
+  McpttInfo info;
+  info.request_uri = alias.empty() ? mcvideo_user() : alias;
+  info.client_id = client_id();
+  info.service["req-type"] = alias.empty() ? "functional-alias-status-determination" : "fa-user-status-determination";
+  // Steps 4 and 5: 4294967295 for the state and its changes, 0 for the state once.
+  const auto dialog = sip_.subscribe(
+      mcvideo_service_uri(), "presence", fetch ? 0u : 4294967295u,
+      {{"P-Preferred-Service", mcvideo_service.icsi}, {"Accept", "application/pidf+xml"}},
+      [this, alias](const SipResponse &response) {
+        if (response.status_code < 200) return;
+        status_["mcvideo_functional_alias_subscription_result"] = {{"alias", alias}, {"status", response.status_code}};
+        if (response.status_code >= 300)
+          std::erase_if(mcvideo_alias_dialogs_, [&](const auto &subscription) { return subscription.second == alias; });
+      },
+      mcvideo_service.info_mime, service_info_xml(info, mcvideo_service));
+  mcvideo_alias_dialogs_[dialog] = alias;
+  event("mcvideo_functional_alias_subscription_requested", {{"alias", alias}, {"fetch", fetch}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.281 clause 20.2.1.3: de-subscribe from the functional alias status: a SUBSCRIBE in the dialog with Expires 0.
+void Client::mcvideo_alias_unsubscribe(const std::string &alias) {
+  const auto found = std::find_if(mcvideo_alias_dialogs_.begin(), mcvideo_alias_dialogs_.end(),
+                                  [&](const auto &subscription) { return subscription.second == alias; });
+  if (found == mcvideo_alias_dialogs_.end()) throw std::runtime_error("no functional alias status subscription");
+  sip_.request_in_dialog(found->first, "SUBSCRIBE", "", "",
+                         {{"Event", "presence"},
+                          {"Expires", "0"},
+                          {"Accept", "application/pidf+xml"}, // TS 24.281 clause 20.2.1.3
+                          {"P-Preferred-Service", mcvideo_service.icsi}});
+}
+
+//------------------------------------------------------------------------------
+// TS 24.281 clause 20.2.1.3: the NOTIFY with the per-user or per-functional alias status (clause 20.3.1.2).
+// The per-user status replaces this client's view of its active aliases, so a
+// take-over by another user or a deactivation by the server is seen.
+SipResponse Client::mcvideo_alias_notify(const SipMessage &message) {
+  SipResponse response;
+  response.status_code = 200;
+  if (asserted_identity(message) != mcvideo_service_uri()) {
+    response.status_code = 403;
+    return response;
+  }
+  const auto subscription = mcvideo_alias_dialogs_.find(message.dialog_id);
+  if (subscription == mcvideo_alias_dialogs_.end()) { // RFC 6665 section 4.1.3: no such subscription
+    response.status_code = 481;
+    return response;
+  }
+  const auto alias = subscription->second;
+  for (const auto &part :
+       message.parts.empty() ? std::vector<BodyPart>{{message.content_type, message.body}} : message.parts) {
+    if (part.content_type != "application/pidf+xml") continue;
+    FunctionalAliasStatus notified;
+    try {
+      notified = parse_functional_alias_status(part.body);
+    } catch (const std::exception &) {
+      response.status_code = 400;
+      return response;
+    }
+    if (!notified.mcvideo) {
+      response.status_code = 400;
+      return response;
+    }
+    if (alias.empty() && !notified.per_alias && notified.entity == mcvideo_user()) {
+      std::set<std::string> active, standing, possible;
+      std::map<std::string, std::string> statuses;
+      for (const auto &entry : notified.entries) {
+        statuses[entry.alias] = entry.status;
+        if (entry.status == "activated" || entry.status == "deactivating")
+          active.insert(entry.alias);
+        else if (entry.status == "take-over-possible")
+          possible.insert(entry.alias);
+        if (entry.status == "activated" || entry.status == "activating") standing.insert(entry.alias);
+      }
+      mcvideo_aliases_ = active;
+      mcvideo_aliases_standing_ = standing;
+      mcvideo_takeover_possible_ = possible;
+      mcvideo_alias_status_known_ = true;
+      // The outcome of this client's last change, by its <p-id-fa> (or a later NOTIFY while it was under way); the
+      // take-over the user asked for follows once the alias is offered.
+      const bool handled = !notified.publish_id.empty() && mcvideo_fa_result_.is_object() &&
+                           mcvideo_fa_result_.value("p_id_fa", "") == notified.publish_id;
+      if (!notified.publish_id.empty() && notified.publish_id == mcvideo_alias_publish_open_)
+        mcvideo_alias_publish_open_.clear();
+      const auto take_over = settle_alias_outcomes(mcvideo_fa_result_, statuses, handled, mcvideo_takeover_wanted_);
+      if (handled) event("mcvideo_functional_alias_result", mcvideo_fa_result_);
+      if (!take_over.empty()) schedule([this, take_over] { mcvideo_functional_alias("takeover", take_over); });
+    } else if (!alias.empty() && notified.entity == alias && (notified.per_alias || notified.entries.empty())) {
+      std::vector<std::string> users;
+      for (const auto &entry : notified.entries) users.push_back(entry.user);
+      mcvideo_alias_users_[alias] = users;
+    } else {
+      response.status_code = 400;
+      return response;
+    }
+    mcvideo_fa_notified_ = {{"alias", alias}, {"p_id_fa", notified.publish_id}, {"entries", notified.entries.size()}};
+    event("mcvideo_functional_alias_notified", mcvideo_fa_notified_);
+  }
+  if (get_header(message.headers, "Subscription-State").starts_with("terminated"))
+    mcvideo_alias_dialogs_.erase(message.dialog_id);
+  return response;
+}
+
+} // namespace mcx

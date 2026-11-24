@@ -1,0 +1,214 @@
+//
+// OpenMCX Licence Information : AGPL-3.0-or-later
+//
+
+package org.openmcx.client.documents
+
+import org.openmcx.client.body.Xml
+import org.openmcx.client.body.children
+import org.openmcx.client.body.descendants
+import org.openmcx.client.body.text
+import org.openmcx.client.http.HttpClient
+import org.w3c.dom.Element
+import org.openmcx.client.security.KeyClient
+import kotlinx.serialization.json.*
+import org.openmcx.client.mcdata.GroupFdPolicy
+
+class DocumentError(message: String) : Exception(message)
+
+/**
+ * The MCPTT user profile document of TS 24.484 V19.4.0 clause 8.3 (namespace of 8.3.2.4), as the
+ * OpenMCX CMS serves it. What the schema cannot express (client ID, …) is in the CMS's extension
+ * namespace ([EXTENSION_NS]), which 8.3.2.1 item 12 permits.
+ */
+data class UserProfile(
+    val mcpttId: String?,
+    val clientId: String?,
+    val groups: List<String>,
+    /** Granted rights, by their TS 24.484 element names (`allow-private-call`, …). */
+    val actions: Set<String>,
+    val privateCallTargets: List<String>,
+    /**
+     * The functional aliases the user is authorised to activate (§8.3.2.1 item 10 g ii): the <uri-entry> of each
+     * <entry> of <FunctionalAliasList> in the <anyExt> of <OnNetwork>.
+     */
+    val functionalAliases: List<String> = emptyList(),
+) {
+    fun allows(action: String) = action in actions
+
+    companion object {
+        const val NS = "urn:3gpp:mcptt:user-profile:1.0"
+        const val MCDATA_NS = "urn:3gpp:ns:mcdata:user-profile:1.0"
+        const val EXTENSION_NS = "urn:openmcx:ns:userProfile:1.0"
+        const val COMMON_POLICY_NS = "urn:ietf:params:xml:ns:common-policy"
+
+        private fun Element.kids(name: String, ns: String = NS) = children(name).filter { it.namespaceURI == ns }
+        private fun Element.kid(name: String, ns: String = NS) = kids(name, ns).firstOrNull()
+        private fun Element.uriEntry() = kid("uri-entry")?.text()?.trim()?.takeIf { it.isNotEmpty() }
+
+        fun parse(text: String): UserProfile {
+            val root = Xml.parse(text)
+            if (root.localName != "mcptt-user-profile" || root.namespaceURI != NS) throw DocumentError("not a TS 24.484 user profile")
+            val common = root.kids("Common")
+            val extension = root.kid("profile-extension", EXTENSION_NS)
+            return UserProfile(
+                mcpttId = common.firstNotNullOfOrNull { it.kid("MCPTTUserID")?.uriEntry() }
+                    ?: root.getAttribute("XUI-URI").takeIf { it.isNotEmpty() },
+                clientId = extension?.kid("client-id", EXTENSION_NS)?.text()?.trim(),
+                // <OnNetwork>/<MCPTTGroupInfo>/<entry>/<uri-entry>
+                groups = root.kids("OnNetwork").flatMap { it.kids("MCPTTGroupInfo") }.flatMap { it.kids("entry") }.mapNotNull { it.uriEntry() },
+                actions = rights(root),
+                // <Common>/<PrivateCall>/<PrivateCallList>/<PrivateCallURI>/<uri-entry>
+                privateCallTargets = common.flatMap { it.kids("PrivateCall") }.flatMap { it.kids("PrivateCallList") }
+                    .flatMap { it.kids("PrivateCallURI") }.mapNotNull { it.uriEntry() },
+                functionalAliases = root.kids("OnNetwork").flatMap { it.kids("anyExt") }.flatMap { it.kids("FunctionalAliasList") }
+                    .flatMap { it.kids("entry") }.mapNotNull { it.uriEntry() },
+            )
+        }
+
+        /**
+         * 8.3.2.1 item 11: each right is a boolean element of the `<cp:ruleset>` actions, directly or in
+         * their `<anyExt>`; the MCData rights are elements of the MCData user profile (10.3.2.3). A right
+         * is granted when its element is true.
+         */
+        private fun rights(root: Element): Set<String> {
+            val out = mutableSetOf<String>()
+            fun collect(list: Element) {
+                for (e in list.children()) {
+                    if (e.localName == "anyExt" && e.namespaceURI == NS) { collect(e); continue }
+                    if (e.namespaceURI !in setOf(NS, MCDATA_NS, EXTENSION_NS)) continue
+                    if (e.text().trim() in setOf("true", "1")) out += e.localName
+                }
+            }
+            root.kids("ruleset", COMMON_POLICY_NS).flatMap { it.kids("rule", COMMON_POLICY_NS) }
+                .flatMap { it.kids("actions", COMMON_POLICY_NS) }.forEach(::collect)
+            return out
+        }
+    }
+}
+
+/** A group document (TS 24.481 §7.2), the parts this client uses. */
+data class GroupDocument(val uri: String, val members: List<String>, val services: Set<String>, val protectMedia: Boolean,
+                         val fd: GroupFdPolicy? = null) {
+    val mcptt get() = services.any { it.endsWith("icsi.mcptt") }
+    val mcdata get() = services.any { it.endsWith("icsi.mcdata") }
+
+    companion object {
+        fun parse(text: String): GroupDocument {
+            val root = Xml.parse(text)
+            val service = root.descendants("list-service").firstOrNull() ?: throw DocumentError("no list-service")
+            val extension = service.descendants("configuration")
+                .firstOrNull { it.namespaceURI == "urn:openmcx:ns:groupConfiguration:1.0" }
+                ?.let { Json.parseToJsonElement(it.text()).jsonObject["mcdata"] as? JsonObject }
+            val fd = extension?.let {
+                GroupFdPolicy(it["allow_fd"]?.jsonPrimitive?.booleanOrNull ?: false,
+                    it["fd_supported"]?.jsonPrimitive?.booleanOrNull ?: false,
+                    it["max_fd_bytes"]?.let { n -> n.jsonPrimitive.longOrNull ?: throw DocumentError("invalid group FD limit") })
+            }
+            return GroupDocument(
+                uri = service.getAttribute("uri"),
+                members = service.descendants("entry").map { it.getAttribute("uri") },
+                services = service.descendants("service").map { it.getAttribute("enabler") }.toSet(),
+                protectMedia = service.descendants("protect-media").firstOrNull()?.text() == "true",
+                fd = fd,
+            )
+        }
+    }
+}
+
+/**
+ * The service configuration documents (TS 24.484 §8.4, §9.4, §10.4) as the clients read them: the Resource-Priority
+ * values by level (`emergency`, `imminent`, `normal`), each `<namespace>.<priority>` of RFC 8101 (mcpttp or mcpttq,
+ * 0 to 15). MCData's are in the `<anyExt>` of `<on-network>` (§10.4.2.1 item 4).
+ */
+object ServiceConfig {
+    private val levels = mapOf("emergency" to "emergency-resource-priority",
+        "imminent" to "imminent-peril-resource-priority", "normal" to "normal-resource-priority")
+
+    /**
+     * TS 24.484 §8.4.2.1: `<floor-control-queue>` in `<on-network>` of the MCPTT service configuration: the floor control
+     * server queues floor requests, so the client offers `mc_queueing` (TS 24.380 §14.2.2).
+     */
+    fun floorQueue(text: String): Boolean {
+        val root = Xml.parse(text)
+        if (root.localName != "service-configuration-info" || root.namespaceURI?.endsWith("ServiceConfig:1.0") != true)
+            throw DocumentError("not a service configuration document")
+        return root.descendants("floor-control-queue").any()
+    }
+
+    /**
+     * TS 24.379 §6.6.2.3.1 and §6.6.3.3.1 (TS 24.281 the same, TS 24.282 §6.5.2.3.1 and §6.5.3.3.1): the
+     * `<confidentiality-protection>` and `<integrity-protection>` of `<signalling-protection>` in `<on-network>`;
+     * protection is enabled when the element is "true" or absent (TS 24.484 §8.4.2.7 NOTE 4, default "true"). Returns
+     * (confidentiality, integrity).
+     */
+    fun signallingProtection(text: String): Pair<Boolean, Boolean> {
+        val root = Xml.parse(text)
+        if (root.localName != "service-configuration-info" || root.namespaceURI?.endsWith("ServiceConfig:1.0") != true)
+            throw DocumentError("not a service configuration document")
+        val signalling = root.descendants("on-network").firstOrNull()?.descendants("signalling-protection")?.firstOrNull()
+        fun enabled(name: String): Boolean {
+            val value = signalling?.descendants(name)?.firstOrNull()?.text()?.trim() ?: return true
+            return when (value) {
+                "true", "1" -> true
+                "false", "0" -> false
+                else -> throw DocumentError("<$name> is not a boolean: $value")
+            }
+        }
+        return enabled("confidentiality-protection") to enabled("integrity-protection")
+    }
+
+    fun resourcePriorities(text: String): Map<String, String> {
+        val root = Xml.parse(text)
+        if (root.localName != "service-configuration-info" || root.namespaceURI?.endsWith("ServiceConfig:1.0") != true)
+            throw DocumentError("not a service configuration document")
+        return levels.mapValues { (_, element) ->
+            val value = root.descendants(element).firstOrNull() ?: throw DocumentError("no <$element>")
+            val space = value.descendants("resource-priority-namespace").firstOrNull()?.text()?.trim()
+            val level = value.descendants("resource-priority-priority").firstOrNull()?.text()?.trim()
+            if ((space != "mcpttp" && space != "mcpttq") || level == null || !Regex("0|[1-9]|1[0-5]").matches(level))
+                throw DocumentError("<$element> is not an RFC 8101 value: $space.$level")
+            "$space.$level"
+        }
+    }
+}
+
+/**
+ * XCAP retrieval (RFC 4825 §7.3) of the profile and group documents, with the access token (TS 24.481 §6.3.3).
+ * [cms] and [gms] are the `<CMS-XCAP-root-URI>` and `<GMS-XCAP-root-URI>` (TS 24.484 §7.2.2.7 items 7 and 8), used as
+ * given.
+ */
+class DocumentClient(private val http: HttpClient, private val cms: String, private val gms: String) {
+    private val etags = mutableMapOf<String, Pair<String, String>>() // url -> (etag, body)
+
+    private fun enc(s: String) = KeyClient.xcapSegment(s)
+
+    private suspend fun fetch(url: String, token: String): String {
+        val headers = mutableMapOf("Authorization" to "Bearer $token")
+        etags[url]?.let { headers["If-None-Match"] = it.first }
+        val r = http.get(url, headers)
+        return when (r.status) {
+            200 -> r.text.also { body -> r.header("ETag")?.let { etags[url] = it to body } }
+            304 -> etags[url]!!.second
+            else -> throw DocumentError("GET $url: HTTP ${r.status}")
+        }
+    }
+
+    /** TS 24.484 §8.3.1A: the user's MCPTT user profile document, mcptt-user-profile-<index>.xml. */
+    suspend fun userProfile(mcpttId: String, index: Int, token: String): UserProfile =
+        UserProfile.parse(fetch("$cms/org.3gpp.mcptt.user-profile/users/${enc(mcpttId)}/mcptt-user-profile-$index.xml", token))
+
+    /** TS 24.484 §8.4.2.8 (§9.4.2.8, §10.4.2.8): the service configuration document of `mcptt`, `mcvideo` or `mcdata`. */
+    suspend fun serviceConfiguration(service: String, token: String): String =
+        fetch("$cms/org.3gpp.$service.service-config/global/service-config.xml", token)
+
+    suspend fun serviceResourcePriorities(service: String, token: String): Map<String, String> =
+        ServiceConfig.resourcePriorities(serviceConfiguration(service, token))
+
+    /** TS 24.484 §8.2.1: the MCPTT UE configuration document of the user [mcpttId] on the UE [ueId] (read as text). */
+    suspend fun ueConfiguration(mcpttId: String, ueId: String, token: String): String =
+        fetch("$cms/org.3gpp.mcptt.ue-config/users/${enc(mcpttId)}/${enc(ueId)}", token)
+
+    suspend fun group(groupId: String, token: String): GroupDocument =
+        GroupDocument.parse(fetch("$gms/org.openmobilealliance.groups/global/byGroupID/${enc(groupId)}", token))
+}
