@@ -43,3 +43,6 @@ jobs:
             Virtuser MCX for Android 13 and later (based on OpenMCX, AGPL-3.0).
             Test build, signed with the test key: for demo phones only.
             Install: open this link on the phone and install the APK
+                        https://github.com/cborrman/virtuser-mcx/releases/latest/download/virtuser-mcx.apk
+          files: virtuser-mcx.apk
+          make_latest: true
