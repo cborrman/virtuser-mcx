@@ -421,10 +421,10 @@ private fun SettingsScreen(state: UiState, actions: UiActions, close: () -> Unit
             Section("About Virtuser MCX")
             Text("Virtuser MCX is provided by Virtuser (virtuser.com). It is built on OpenMCX, the first open-source implementation of 3GPP Release ${org.openmcx.client.RELEASE} Mission Critical Services, licensed AGPL-3.0. Source: github.com/cborrman/virtuser-mcx")
             val uri = androidx.compose.ui.platform.LocalUriHandler.current
-            TextButton(onClick = { runCatching { uri.openUri("https://openmcx.com") } }, contentPadding = PaddingValues(0.dp),
-                modifier = Modifier.testTag(Tags.ABOUT_LINK)) { Text("Visit openmcx.com for more information") }
-            TextButton(onClick = { runCatching { uri.openUri("mailto:contact@openmcx.com") } }, contentPadding = PaddingValues(0.dp)) {
-                Text("Contact: contact@openmcx.com")
+            TextButton(onClick = { runCatching { uri.openUri("https://virtuser.com") } }, contentPadding = PaddingValues(0.dp),
+                modifier = Modifier.testTag(Tags.ABOUT_LINK)) { Text("Visit virtuser.com for more information") }
+            TextButton(onClick = { runCatching { uri.openUri("mailto:info@virtuser.com") } }, contentPadding = PaddingValues(0.dp)) {
+                Text("Contact: info@virtuser.com")
             }
             Text("Version ${org.openmcx.client.app.BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall, color = Mcx.Muted,
                 modifier = Modifier.padding(bottom = 16.dp))
