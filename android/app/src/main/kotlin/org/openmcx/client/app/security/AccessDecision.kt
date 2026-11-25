@@ -73,10 +73,11 @@ object AccessDecision {
             val aka = ImsAkaConfig(identities!!.impi, identities.impu, identities.domain, pcscf, port, PROTECTED_SERVER_PORT)
             SipAccess.ImsAka(AndroidImsAkaPlatform(context, card), aka) to
                 State("IMS AKA", "card and network ready", cardText)
-        } else if (onMobileData(context)) {
-            SipAccess.Refused("mobile data needs the card: $why") to State("not registered", "mobile data needs the card", cardText)
         } else {
-            SipAccess.Digest to State("SIP digest", why, cardText)
+            // Virtuser MCX: SIP digest over any network, mobile data included. Our phones reach the MCX server
+            // through a WireGuard tunnel on a public network (e.g. Movistar SV), without operator ISIM privileges,
+            // so the upstream rule "mobile data needs the card" would stop every call off Wi-Fi.
+            SipAccess.Digest to State("SIP digest", why + if (onMobileData(context)) " (mobile data, via tunnel)" else "", cardText)
         }
         _current.value = decided.second
         log("SIP core access: ${decided.second.method} (${decided.second.reason}${if (why != null) "; $why" else ""})")

@@ -15,8 +15,9 @@ android {
         applicationId = "com.virtuser.mcx"
         minSdk = 30
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0-virtuser"
+        // Virtuser MCX: each GitHub build numbers itself (run 6 = versionCode 6, 0.1.6), so Android sees each as newer.
+        versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        versionName = "0.1.${System.getenv("GITHUB_RUN_NUMBER") ?: "0"}"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     // Virtuser MCX: one fixed TEST signing key, so each build from GitHub installs over the last.
