@@ -183,7 +183,8 @@ class MainActivity : ComponentActivity() {
                 // Location reporting to the MC service (TS 24.379 clause 13): position and cell.
                 Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
         val tab = if (intent.getStringExtra(EXTRA_TAB) == TAB_MESSAGES) 2 else 0 // Call, Video, Message, History, Logs
-        setContent { OpenMcxTheme(dark = isSystemInDarkTheme()) { McxApp(state, actions, tab) } }
+        // Virtuser MCX: always light, whatever the phone's dark-mode setting (readable outdoors, matches the brand).
+        setContent { OpenMcxTheme(dark = false) { McxApp(state, actions, tab) } }
         // In a call the volume keys set the call's volume (the earpiece's or the loudspeaker's), not the media volume.
         lifecycleScope.launch {
             kotlinx.coroutines.flow.combine(Engine.inCall, Engine.inVideoCall) { a, v -> a || v }.collect { calling ->
